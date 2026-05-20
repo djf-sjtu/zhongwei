@@ -1,0 +1,101 @@
+# -*- coding: utf-8 -*-
+# services/scheduling/scheduler_core.py - 核心调度服务
+"""
+核心调度服务
+职责：任务分配、等待队列管理
+"""
+import time
+import logging
+
+from entities import SchedulingWafer
+from config import SystemConfig
+from domain import ResourceValidator
+from common import LogIcon
+from .robot_selector import RobotSelector
+from utils import is_chamber,calc_transport_time
+from services.planning import PathPlanner
+
+class SchedulerCore:
+    """核心调度器"""
+
+    def __init__(self, system, resource_selector):
+        self.system = system
+        self.resource_selector = resource_selector
+        self.transport_service = None  # 后续注入
+
+    def assign_next_task(self, wafer: SchedulingWafer):
+        """为wafer分配下一个传输任务到机械臂"""
+        if not wafer.assignment_queue:
+            return
+
+        # Wafer正忙，加入等待队列
+        if wafer.busy == 1:
+            logging.warning(f"{LogIcon.PLAN} Wafer {wafer.wafer_id} 正忙，无法分配任务")
+            self.add_to_waiting(wafer)
+            return
+
+        # 动态选择目标位置（如果需要）
+        next_task = wafer.assignment_queue[0]
+        if not next_task.to_location:
+            location = self.resource_selector.select_next_location_for_wafer(wafer)
+            if not location:
+                logging.info(f"{LogIcon.WAIT} 动态分配位置失败: Wafer {wafer.wafer_id}: "
+                           f"分配传输{next_task.to_location}失败，等待下次分配")
+                self.add_to_waiting(wafer)
+                return
+
+        # 选择机械臂
+        robot_id = RobotSelector.select_robot(next_task.from_location, next_task.to_location)
+        robot = self.system.robots.get(robot_id)
+
+        if robot:
+            robot.transport_queue.append(next_task)
+            logging.info(f"{LogIcon.PLAN} 分配{robot.robot_id}传输任务: Wafer {wafer.wafer_id}: "
+                        f"{next_task.from_location} → {next_task.to_location}")
+
+            # 触发机械臂处理
+            if self.transport_service:
+                self.transport_service.process_robot_queue(robot)
+
+    def add_to_waiting(self, wafer: SchedulingWafer):
+        """添加到等待队列"""
+        if wafer not in self.system.waiting_wafers:
+            self.system.waiting_wafers.append(wafer)
+            logging.info(f"等待: Wafer {wafer.wafer_id} 暂时不能被调度，推入等待队列")
+
+    def check_waiting_wafers(self):
+        """检查等待队列"""
+        for wafer in list(self.system.waiting_wafers):
+            # 无任务，移除
+            if not wafer.assignment_queue:
+                self.system.waiting_wafers.remove(wafer)
+                continue
+
+            next_assignment = wafer.assignment_queue[0]
+
+            # 尝试动态选择位置
+            if not next_assignment.to_location:
+                location = self.resource_selector.select_next_location_for_wafer(wafer)
+                if not location:
+                    continue
+
+            # 检查目标是否ready
+            if ResourceValidator.is_next_step_ready(wafer, next_assignment, self.system):
+                self.system.waiting_wafers.remove(wafer)
+                self.assign_next_task(wafer)
+            else:
+                # 检查暂存时间
+                self._check_storage_time(wafer)
+
+    def _check_storage_time(self, wafer: SchedulingWafer):
+        """检查chamber暂存时间"""
+        if not wafer.storage_start_time:
+            return
+
+        storage_duration = time.time() - wafer.storage_start_time
+        warning_threshold = SystemConfig.SCHEDULING_CONFIG.get(
+            'chamber_storage_warning_threshold', 120.0
+        )
+
+        if storage_duration > warning_threshold:
+            logging.warning(f"⚠️ Wafer {wafer.wafer_id} 在{wafer.current_location_id} 暂存时间过长: {storage_duration:.1f}s")
