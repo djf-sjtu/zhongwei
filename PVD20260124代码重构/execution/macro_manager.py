@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from models import ProcessJob, Recipe, Macro, module_id_to_str
 from entities import SchedulingChamber
 from config import ConfigService
-from domain import WaferService
 from common import LogIcon
 
 
@@ -69,7 +68,7 @@ class MacroManager:
                     continue
 
                 process_type = ConfigService.get_process_type(module_str)
-                film_consumption = WaferService.calculate_film_consumption_from_recipe(
+                film_consumption = ConfigService.calculate_film_consumption_from_recipe(
                     recipe, module_str
                 )
 

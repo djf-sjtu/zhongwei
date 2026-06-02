@@ -4,27 +4,25 @@
 工具层
 提供纯工具函数，无业务逻辑
 """
-from .location_utils import LocationParser
-from .type_checks import (
+from .location_utils import (
+    LocationParser,
     is_foup,
     is_ll,
     is_tbs,
     is_aligner,
-    is_chamber
+    is_chamber,
 )
 from .time_helpers import TimeHelper
 
 __all__ = [
-    # 位置解析
+    # 位置解析与类型谓词
     'LocationParser',
-    
-    # 类型检查
     'is_foup',
     'is_ll',
     'is_tbs',
     'is_aligner',
     'is_chamber',
-    
+
     # 时间工具
     'TimeHelper',
 ]

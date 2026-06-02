@@ -7,12 +7,11 @@
 import time
 import logging
 
-from entities import SchedulingWafer
-from config import SystemConfig
+from entities import SchedulingWafer, SchedulingChamber
+from config import SystemConfig, ConfigService
 from domain import ResourceValidator
-from common import LogIcon
-from .robot_selector import RobotSelector
-from utils import is_chamber
+from common import LogIcon, trace_writer
+from utils import is_chamber, LocationParser
 from services.planning import PathPlanner
 
 class SchedulerCore:
@@ -22,6 +21,8 @@ class SchedulerCore:
         self.system = system
         self.resource_selector = resource_selector
         self.transport_service = None  # 后续注入
+        self.path_planner = None       # 后续注入
+        self._last_warning_times: dict = {}  # wafer_id -> 上次打印暂存警告的时间
 
     def assign_next_task(self, wafer: SchedulingWafer):
         """为wafer分配下一个传输任务到机械臂"""
@@ -45,13 +46,19 @@ class SchedulerCore:
                 return
 
         # 选择机械臂
-        robot_id = RobotSelector.select_robot(next_task.from_location, next_task.to_location)
+        robot_id = ConfigService.get_robot_for_transport(next_task.from_location, next_task.to_location)
         robot = self.system.robots.get(robot_id)
 
         if robot:
             robot.transport_queue.append(next_task)
             logging.info(f"{LogIcon.PLAN} 分配{robot.robot_id}传输任务: Wafer {wafer.wafer_id}: "
                         f"{next_task.from_location} → {next_task.to_location}")
+
+            # task_assigned trace 事件已下移到 TransportExecutor._select_best_task：
+            # 那里是"任务真正被选中执行"的时点，比这里"放进 robot 队列"的语义
+            # 更准确——因为 _handle_not_ready 会把暂时不 ready 的任务从 robot 队列
+            # pop 掉、wafer 进 waiting_wafers 等下次 check，下次 assign_next_task
+            # 再次入队就构成"乐观重试"。重试在 trace 中不应该重复出现。
 
             # 触发机械臂处理
             if self.transport_service:
@@ -88,17 +95,119 @@ class SchedulerCore:
                 self._check_storage_time(wafer)
 
     def _check_storage_time(self, wafer: SchedulingWafer):
-        """检查chamber暂存时间"""
+        """检查chamber暂存时间，超时后触发临时停靠"""
         if not wafer.storage_start_time:
+            return
+        if not is_chamber(wafer.current_location_id):
             return
 
         storage_duration = time.time() - wafer.storage_start_time
-        warning_threshold = SystemConfig.SCHEDULING_CONFIG.get(
+        threshold = SystemConfig.SCHEDULING_CONFIG.get(
             'chamber_storage_warning_threshold', 120.0
         )
 
-        if storage_duration > warning_threshold:
-            logging.warning(f"⚠️ Wafer {wafer.wafer_id} 在{wafer.current_location_id} 暂存时间过长: {storage_duration:.1f}s")
+        if storage_duration <= threshold:
+            return
+
+        # 下一目标 chamber 即将腾出，不触发临时停靠——继续等待
+        if self._next_chamber_frees_soon(wafer, threshold):
+            return
+
+        # 超时：尝试临时停靠
+        if self.path_planner and self.path_planner.temp_park_wafer(wafer, wafer.current_step_index):
+            wafer.storage_start_time = None  # 已处理，清除计时避免重复触发
+            self.system.waiting_wafers.remove(wafer)
+            self.assign_next_task(wafer)
+        else:
+            now = time.time()
+            if now - self._last_warning_times.get(wafer.wafer_id, 0) >= 10.0:
+                logging.warning(
+                    f"⚠️ Wafer {wafer.wafer_id} 在 {wafer.current_location_id} "
+                    f"暂存超时 {storage_duration:.1f}s，无可用停靠位"
+                )
+                self._last_warning_times[wafer.wafer_id] = now
+
+    def _next_chamber_frees_soon(self, wafer: SchedulingWafer, threshold: float) -> bool:
+        """判断 wafer 的下一目标 chamber 是否即将腾出。
+
+        两种情况均视为"即将腾出"，不应触发临时停靠：
+        1. chamber 当前任务剩余时间 < threshold（快完成了，等一等即可）
+        2. chamber 任务刚结束（last_task_end_time 在最近数秒内），wafer 尚未被传输走
+        """
+        next_task = wafer.assignment_queue[0] if wafer.assignment_queue else None
+        if not next_task or not next_task.to_location:
+            return False
+        next_chamber = self.system.chambers.get(next_task.to_location)
+        if not next_chamber:
+            return False
+
+        now = time.time()
+        # 情况1：chamber 正在处理且快完成
+        if next_chamber.current_task and next_chamber.task_start_time:
+            remaining = next_chamber.current_task.duration - (now - next_chamber.task_start_time)
+            if 0 < remaining < threshold:
+                return True
+
+        # 情况2：chamber 任务刚结束，transport 尚未腾出（给5s宽限）
+        if (not next_chamber.current_task and next_chamber.last_task_end_time and
+                now - next_chamber.last_task_end_time < 5.0):
+            return True
+
+        return False
+
+    def _steal_work_for_idle_chamber(self, idle_chamber: SchedulingChamber):
+        """chamber 空闲时，从同工艺兄弟 chamber 的队列末尾抢一片 wafer。
+
+        触发条件：当前 chamber 无 current_task 且 task_queue 为空，
+        而某兄弟 chamber 队列中有 ≥2 个 wafer_process 预订。
+        抢末尾那片（等待时间最长，早迁移收益最大）。
+        """
+        if not self.path_planner:
+            return
+        module_str = LocationParser.get_base_module_id(idle_chamber.location_id)
+        process_type = ConfigService.get_process_type(module_str)
+        if not process_type:
+            return
+        sibling_module_ids = ConfigService.get_modules_by_process_type(process_type)
+
+        # 找积压最多的兄弟 chamber（至少要有 2 个预订才值得抢）
+        best_source = None
+        max_reserves = 1
+        for m in sibling_module_ids:
+            loc_id = f"{m}_1"
+            if loc_id == idle_chamber.location_id:
+                continue
+            chamber = self.system.chambers.get(loc_id)
+            if not chamber or chamber.is_faulted:
+                continue
+            reserve_count = sum(
+                1 for t in chamber.task_queue if t.task_type == 'wafer_process'
+            )
+            if reserve_count > max_reserves:
+                max_reserves = reserve_count
+                best_source = chamber
+
+        if best_source is None:
+            return
+
+        # 从队列末尾找一片可抢的 wafer
+        # 安全条件：wafer 必须在 waiting_wafers 中静止等待，未被机械臂拿起；
+        # 正在传输中的 wafer 不能抢，否则会导致传输时间与实际路径不匹配
+        safe_waiting = {id(w) for w in self.system.waiting_wafers}
+        for task in reversed(best_source.task_queue):
+            if task.task_type != 'wafer_process':
+                continue
+            wafer = self.system.wafers.get(task.wafer_id)
+            if not wafer:
+                continue
+            if id(wafer) not in safe_waiting:
+                continue  # 正在传输中，跳过
+            if self.path_planner.replan_for_faulted_chamber(wafer, best_source.location_id):
+                logging.info(
+                    f"{LogIcon.PLAN} 空闲抢活: Wafer {task.wafer_id} "
+                    f"{best_source.location_id} → {idle_chamber.location_id}"
+                )
+                return
 
     # ================================================================
     # 级联更新

@@ -4,6 +4,7 @@
 传输执行器
 职责：机械臂传输任务的执行与到达事件处理
 """
+import math
 import time
 import threading
 import logging
@@ -13,7 +14,35 @@ from entities import SchedulingRobot, SchedulingWafer, SchedulingLL, TransportTa
 from config import SystemConfig, ConfigService
 from utils import LocationParser, is_ll, is_foup, is_chamber, is_aligner, is_tbs
 from domain import ResourceValidator
-from common import LogIcon, WaferPriorityCalculator
+from common import LogIcon, trace_writer
+
+
+# Wafer 优先级权重 —— 暂存时间因子 + 工序位置因子的加权和。
+# 公式过去封装在 WaferPriorityCalculator，但只有一处调用、无状态、无策略变体，
+# 内联回这里把"调度决策依据"和"调度执行"放在同一文件里，提高 locality。
+_PRIORITY_STORAGE_WEIGHT = 0.5
+_PRIORITY_POSITION_WEIGHT = 0.5
+
+
+def _calculate_wafer_priority(wafer) -> float:
+    """优先级 = 暂存时间因子*权重 + 工序位置因子*权重。值越大越优先。"""
+    # 暂存时间因子：sigmoid，60s 约 0.5、300s 约 0.93
+    storage_start = getattr(wafer, 'storage_start_time', None)
+    if storage_start is None:
+        storage_factor = 0.0
+    else:
+        duration = time.time() - storage_start
+        storage_factor = 1.0 / (1.0 + math.exp(-0.02 * (duration - 60)))
+
+    # 工序位置因子：越靠后分数越高
+    total = len(getattr(wafer, 'path_plan', []) or [])
+    if total > 0:
+        position_factor = getattr(wafer, 'current_step_index', 0) / total
+    else:
+        position_factor = 0.0
+
+    return (storage_factor * _PRIORITY_STORAGE_WEIGHT
+            + position_factor * _PRIORITY_POSITION_WEIGHT)
 
 
 class TransportExecutor:
@@ -23,7 +52,6 @@ class TransportExecutor:
         self.system = system
         self.scheduler = scheduler_core
         self.task_executor = None  # 后续注入
-        self.priority_calc =WaferPriorityCalculator()
 
         # 回调
         self.on_wafer_completed: Optional[Callable] = None
@@ -67,7 +95,7 @@ class TransportExecutor:
             # 检查wafer是否ready且不busy
             if (ResourceValidator.is_next_step_ready(wafer, next_assignment, self.system)
                     and wafer.busy == 0):
-                priority = self.priority_calc.calculate_priority(wafer)
+                priority = _calculate_wafer_priority(wafer)
                 ready_tasks.append((i, task, wafer, priority))
 
         return ready_tasks
@@ -92,6 +120,19 @@ class TransportExecutor:
                      f"(优先级={priority:.3f}, 队列{len(robot.transport_queue)}个任务)")
 
         robot.transport_queue.pop(idx)
+
+        # 等价性 trace：任务被真正选中执行。语义比"入队"更准 —— 因为
+        # 乐观重试机制下，同一个 task 可能被多次入队 / pop 出来，但只有
+        # _select_best_task 选中那一次才真正开始搬运。
+        trace_writer.emit(
+            'task_assigned',
+            wafer_id=wafer.wafer_id,
+            step_idx=wafer.current_step_index,
+            from_location=task.from_location,
+            to_location=task.to_location,
+            robot_id=robot.robot_id,
+        )
+
         return task
 
     def _book_location(self, location_id: str, wafer_id: int):
@@ -154,6 +195,8 @@ class TransportExecutor:
             return
 
         current_step = wafer.path_plan[wafer.current_step_index - 1]
+        if current_step.process_type == 'TEMP_PARK':  # 临时停靠时序已过期，跳过延迟更新
+            return
         delay = time.time() - current_step.estimated_departure
 
         if delay > 2:  # 延迟超过2秒才更新

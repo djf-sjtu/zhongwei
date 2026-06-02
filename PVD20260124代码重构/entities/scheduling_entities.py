@@ -4,6 +4,7 @@
 调度实体 - 只包含状态和简单查询方法
 职责：状态管理，不包含复杂业务逻辑
 """
+import threading
 import time
 from typing import Optional, List
 from dataclasses import dataclass
@@ -31,6 +32,7 @@ class ChamberTask:
     macro_task: Optional[object] = None
     wafer_id: Optional[int] = None
     duration: float = 0.0
+    estimated_arrival: float = 0.0  # 预计 wafer 到达时间（预订任务用）；0 表示立即可开始
 
 
 @dataclass
@@ -79,30 +81,44 @@ class SchedulingWafer(SchedulingEntity):
         self.assignment_queue: List[TransportTask] = []
         self.scheduled_leave_time: Optional[float] = None
         self.path_plan: List[PathStep] = []  # 保存完整的路径规划
+        self._temp_park_count: int = 0  # 已到达的 TEMP_PARK 步骤数（不占 sequence 索引）
+
+    @property
+    def foup_location_id(self) -> str:
+        """Wafer 出发的 FOUP slot 位置 ID（如 "FOUP_A_15"）。"""
+        foup_str = module_id_to_str(self.base.source_foup)
+        slot_value = self.base.source_foup_slot.value
+        return f"{foup_str}_{slot_value}"
 
     def get_current_step(self):
-        """获取当前工艺步骤"""
+        """获取当前工艺步骤（TEMP_PARK 不占 sequence 索引）。"""
         steps = self.base.associated_sequence.sequence_steps
-        if self.current_step_index < len(steps):
-            return steps[self.current_step_index]
+        adjusted = self.current_step_index - self._temp_park_count
+        if adjusted < len(steps):
+            return steps[adjusted]
         return None
 
     def get_next_step(self):
-        """获取下一个工艺步骤"""
+        """获取下一个工艺步骤。"""
         steps = self.base.associated_sequence.sequence_steps
-        next_index = self.current_step_index + 1
+        adjusted = self.current_step_index - self._temp_park_count
+        next_index = adjusted + 1
         if next_index < len(steps):
             return steps[next_index]
         return None
 
     def is_sequence_completed(self) -> bool:
-        """检查是否完成所有工艺"""
+        """检查是否完成所有工艺（TEMP_PARK 不计入完成度）。"""
         total_steps = len(self.base.associated_sequence.sequence_steps)
-        return self.current_step_index + 1 >= total_steps
+        adjusted = self.current_step_index - self._temp_park_count
+        return adjusted + 1 >= total_steps
 
     def move_to_next_location(self, new_location_id: str):
         """移动到下一个位置"""
         self.current_location_id = new_location_id
+        if (self.current_step_index < len(self.path_plan) and
+                self.path_plan[self.current_step_index].process_type == 'TEMP_PARK'):
+            self._temp_park_count += 1
         self.current_step_index += 1
 
 
@@ -134,6 +150,15 @@ class SchedulingChamber(SchedulingEntity):
 
         # 处理历史
         self.processing_history: List[tuple] = []
+
+        # 故障状态（运行时）：
+        # - is_faulted: 外部 fault_chamber 信号置 True；unfault_chamber 置 False
+        # - frozen_task: fault 期间 wafer 任务 thread sleep 完后调 _on_task_completed
+        #   时如果 chamber 仍 is_faulted，task 被暂存在这里，等 unfault 信号触发完成
+        # - _fault_lock: 保护 is_faulted / frozen_task / current_task 三者的原子切换
+        self.is_faulted: bool = False
+        self.frozen_task: Optional[ChamberTask] = None
+        self._fault_lock = threading.Lock()
 
     def needs_dry_cleaning(self) -> bool:
         """检查是否需要干洗"""

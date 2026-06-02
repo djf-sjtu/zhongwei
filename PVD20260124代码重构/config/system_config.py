@@ -10,6 +10,13 @@ class SystemConfig:
     """系统配置类 - 纯配置数据"""
 
     # ================================================================
+    # 仿真加速：业务时间和时间阈值统一乘以 TIME_SCALE
+    # 仅用于缩短 wall-clock 仿真耗时，不影响调度决策的相对关系。
+    # 改回 1.0 即恢复原速。范围由本文件末尾的白名单显式声明。
+    # ================================================================
+    TIME_SCALE = 1.0
+
+    # ================================================================
     # 显示名称配置
     # ================================================================
     CHAMBER_DISPLAY_NAMES = {
@@ -83,6 +90,17 @@ class SystemConfig:
         'EFEM': {'type': 'EFEM', 'arms': ['arm_1', 'arm_2']},
         'TMA': {'type': 'TMA', 'arms': ['arm_1', 'arm_2']},
         'TMB': {'type': 'TMB', 'arms': ['arm_1', 'arm_2']},
+    }
+
+    # 机械臂区域调度规则：from_zone → {to_zone: robot_id}
+    # 缺失的组合返回 ''（原 RobotSelector 行为：未匹配的 LL→LL / LL→TMB / TBS→TBS 等）
+    # 注意：from_zone='EFEM' 或 to_zone='EFEM' 一律使用 'EFEM'，已在表里展开。
+    ROBOT_ZONE_RULES = {
+        'EFEM': {'EFEM': 'EFEM', 'TMA': 'EFEM', 'TMB': 'EFEM', 'LL': 'EFEM', 'TBS': 'EFEM'},
+        'TMA':  {'EFEM': 'EFEM', 'TMA': 'TMA',  'TMB': 'TMA',  'LL': 'TMA',  'TBS': 'TMA'},
+        'TMB':  {'EFEM': 'EFEM', 'TMA': 'TMB',  'TMB': 'TMB',  'LL': 'TMB',  'TBS': 'TMB'},
+        'LL':   {'EFEM': 'EFEM', 'TMA': 'TMA',                                'TBS': 'TMA'},
+        'TBS':  {'EFEM': 'EFEM', 'TMA': 'TMA',  'TMB': 'TMB',  'LL': 'TMA'              },
     }
 
     # ================================================================
@@ -180,3 +198,59 @@ class SystemConfig:
             'FOUP', 'ALIGNER', 'LL', 'ALD', 'TBS', 'PVD2', 'CVD2', 'TBS', 'LL', 'FOUP'
         ]
     }
+
+
+# ================================================================
+# 加载时缩放：把白名单内的"时间/时间阈值"字段统一乘以 TIME_SCALE
+# 任何新增的时间字段必须显式登记到此处，否则不会被缩放。
+# 非时间字段（计数、长度、膜厚阈值等）绝不能登记。
+# ================================================================
+
+# 顶层标量时间字段
+_SCALED_SCALAR_FIELDS = [
+    'COOLING_TIME_SECONDS',
+    'Z_MOVE_TIME',
+    'PICK_PLACE_TIME',
+    'TRANSPORT_BASE_TIME',
+]
+
+# 字典字段中的时间键：dict_attr -> [key, ...]；
+# 值为 None 表示对整个 dict 的所有 value 缩放（用于 PROCESS_TIMES）
+_SCALED_DICT_FIELDS = {
+    'PROCESS_TIMES': None,
+    'ALIGNER_CONFIG': ['process_time_seconds'],
+    'DRY_PUMP_CONFIG': ['pump_time_seconds', 'vent_time_seconds'],
+    'SCHEDULING_CONFIG': [
+        'chamber_storage_warning_threshold',
+        'periodic_check_interval',
+        'scheduling_cycle_interval_seconds',
+        'cleaning_check_interval_seconds',
+        'default_cleaning_duration_hours',
+    ],
+    'CHAMBER_DEFAULT_CONFIG': [
+        'idle_macro_trigger_duration_seconds',
+        'cleaning_duration_minutes',
+    ],
+}
+
+
+def _apply_time_scale():
+    scale = SystemConfig.TIME_SCALE
+    if scale == 1.0:
+        return
+
+    for field in _SCALED_SCALAR_FIELDS:
+        current = getattr(SystemConfig, field)
+        setattr(SystemConfig, field, current * scale)
+
+    for attr, keys in _SCALED_DICT_FIELDS.items():
+        d = getattr(SystemConfig, attr)
+        if keys is None:
+            for k, v in list(d.items()):
+                d[k] = v * scale
+        else:
+            for k in keys:
+                d[k] = d[k] * scale
+
+
+_apply_time_scale()

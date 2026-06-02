@@ -85,6 +85,25 @@ class ConfigService:
         return module_id in SystemConfig.ALIGNER_MODULES
 
     # ================================================================
+    # 机械臂区域调度
+    # ================================================================
+
+    @staticmethod
+    def get_robot_for_transport(from_location: str, to_location: str) -> str:
+        """
+        根据源和目标位置选择搬运机械臂。
+        逻辑：解析两端所在 zone → 查 ROBOT_ZONE_RULES 表 → 返回 robot_id。
+        未匹配的组合返回 ''（保留原 RobotSelector 行为）。
+        """
+        # 延迟 import 规避 utils <-> config 循环
+        from utils import LocationParser
+        from_base = LocationParser.get_base_module_id(from_location)
+        to_base = LocationParser.get_base_module_id(to_location)
+        from_zone = ConfigService.get_module_zone(from_base)
+        to_zone = ConfigService.get_module_zone(to_base)
+        return SystemConfig.ROBOT_ZONE_RULES.get(from_zone, {}).get(to_zone, '')
+
+    # ================================================================
     # LL相关查询
     # ================================================================
 
@@ -152,14 +171,35 @@ class ConfigService:
     def get_film_consumption(process_type: str) -> int:
         """
         获取膜厚消耗
-        
+
         Args:
             process_type: 工艺类型
-            
+
         Returns:
             int: 膜厚消耗值
         """
         return SystemConfig.PROCESS_FILM_CONSUMPTION.get(process_type, 1)
+
+    @staticmethod
+    def calculate_film_consumption_from_recipe(recipe, target_module_id) -> int:
+        """
+        从 Recipe 查特定模块的膜厚消耗；找不到时按工艺类型回退到默认值。
+        target_module_id 接受 ModuleID 或字符串。
+        """
+        from models import module_id_to_str
+        target_module_str = (
+            module_id_to_str(target_module_id)
+            if not isinstance(target_module_id, str)
+            else target_module_id
+        )
+
+        for recipe_view in recipe.recipe_views:
+            if module_id_to_str(recipe_view.module_id) == target_module_str:
+                return recipe_view.film_thickness_on_station[0]
+
+        # Recipe 中没有找到，使用配置默认值
+        process_type = ConfigService.get_process_type(target_module_str)
+        return ConfigService.get_film_consumption(process_type)
 
     # ================================================================
     # 模块列表查询

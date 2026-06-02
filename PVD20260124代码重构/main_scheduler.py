@@ -11,6 +11,7 @@ if str(project_root) not in sys.path:
 半导体制造调度系统 - 主入口
 使用重构后的模块化架构
 """
+import threading
 import time
 import logging
 import random
@@ -21,7 +22,7 @@ from models import (
 )
 from job_coordinator import JobCoordinator
 from config import SystemConfig, ConfigService
-from common import setup_logger, LogIcon, merge_jobs
+from common import setup_logger, LogIcon, merge_jobs, trace_writer
 
 setup_logger()
 
@@ -165,7 +166,20 @@ class SchedulerSimulation:
     # 仿真运行
     # ================================================================
 
-    def run(self, jobs: list):
+    POLL_INTERVAL_SECONDS = 0.5
+
+    def run(self, jobs: list, trace_path: str = None):
+        """运行仿真。trace_path 指定时，把等价性 trace 写到该 JSONL 文件。"""
+        if trace_path:
+            trace_writer.init_trace(trace_path)
+            logging.info(f"{LogIcon.SYSTEM} Trace 输出: {trace_path}")
+        try:
+            self._run_impl(jobs)
+        finally:
+            if trace_path:
+                trace_writer.close_trace()
+
+    def _run_impl(self, jobs: list):
         """运行仿真"""
         logging.info(f"\n{'=' * 80}")
         logging.info(f"{LogIcon.SYSTEM} 开始调度仿真 - {len(jobs)} 个Job")
@@ -179,12 +193,12 @@ class SchedulerSimulation:
         # 启动系统
         self.coordinator.start_system()
 
-        # 等待完成
+        # 等待所有Job完成
         while self.coordinator.running:
-            time.sleep(5.0)
-            
+            time.sleep(self.POLL_INTERVAL_SECONDS)
+
             status = self.coordinator.get_system_status()
-            
+
             if status['job_status']['completed_jobs'] >= len(jobs):
                 break
 
@@ -206,35 +220,63 @@ class SchedulerSimulation:
 # 测试场景
 # ================================================================
 
-def scenario_1_single_job():
+def scenario_1_single_job(trace_path: str = None):
     """场景1: 单个Job"""
     logging.info("\n=== 场景1: 单个Job（简单工艺） ===")
-    
+
     sim = SchedulerSimulation()
     job = sim.create_job(job_id=1, sequence_type='complex', wafer_count=5)
-    sim.run([job])
+    sim.run([job], trace_path=trace_path)
 
 
-def scenario_2_sequential_jobs():
+def scenario_2_sequential_jobs(trace_path: str = None):
     """场景2: 两个顺序Job"""
     logging.info("\n=== 场景2: 两个顺序Job ===")
-    
+
     sim = SchedulerSimulation()
     job1 = sim.create_job(job_id=1, sequence_type='simple', wafer_count=5)
     job2 = sim.create_job(job_id=2, sequence_type='basic', wafer_count=5)
-    sim.run([job1, job2])
+    sim.run([job1, job2], trace_path=trace_path)
 
 
-def scenario_3_merged_jobs():
+def scenario_3_merged_jobs(trace_path: str = None):
     """场景3: 合并并行Job"""
     logging.info("\n=== 场景3: 合并并行Job ===")
-    
+
     sim = SchedulerSimulation()
     job1 = sim.create_job(job_id=1, sequence_type='simple', wafer_count=5)
     job2 = sim.create_job(job_id=2, sequence_type='basic', wafer_count=5)
     #job3 = sim.create_job(job_id=3, sequence_type='complex', wafer_count=5)
     merged_job = merge_jobs(job1, job2)
-    sim.run([merged_job])
+    sim.run([merged_job], trace_path=trace_path)
+
+
+def scenario_4_fault_chamber_basic(trace_path: str = None):
+    """场景4: 单个Job + 单次 chamber 故障，演示 #02 重规划 + #03 TEMP_PARK。
+
+    故障时间线：
+    - t=300s : CVD2_A_1 故障  → 先到的 wafer 改道 CVD2_B_1 (#02)
+                              → CVD2_B_1 若已满，后到的 wafer 临停 TBS (#03)
+    - t=420s : CVD2_A_1 恢复 → 临停 wafer 被正常调度进 CVD2_A_1
+    """
+    logging.info("\n=== 场景4: 单个Job + CVD2_A_1 故障（T=300s）===")
+
+    sim = SchedulerSimulation()
+    job = sim.create_job(job_id=1, sequence_type='complex', wafer_count=5)
+
+    timers = [
+        threading.Timer(300.0, sim.coordinator.fault_chamber,   args=('CVD2_A_1',)),
+        threading.Timer(420.0, sim.coordinator.unfault_chamber, args=('CVD2_A_1',)),
+    ]
+    for t in timers:
+        t.daemon = True
+        t.start()
+
+    try:
+        sim.run([job], trace_path=trace_path)
+    finally:
+        for t in timers:
+            t.cancel()
 
 
 
@@ -244,8 +286,23 @@ def scenario_3_merged_jobs():
 # ================================================================
 
 if __name__ == "__main__":
-    # 运行场景
-    #scenario_1_single_job()
-    # scenario_2_sequential_jobs()
-    scenario_3_merged_jobs()
-    # scenario_4_complex_flow()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="PVD 调度仿真器")
+    parser.add_argument(
+        '--scenario', type=int, default=1, choices=[1, 2, 3, 4],
+        help='跑哪个 scenario（1=单Job, 2=顺序Job, 3=合并Job, 4=单Job+chamber故障）'
+    )
+    parser.add_argument(
+        '--trace', type=str, default=None,
+        help='trace JSONL 输出路径（用于重构等价性比对）'
+    )
+    args = parser.parse_args()
+
+    scenarios = {
+        1: scenario_1_single_job,
+        2: scenario_2_sequential_jobs,
+        3: scenario_3_merged_jobs,
+        4: scenario_4_fault_chamber_basic,
+    }
+    scenarios[args.scenario](trace_path=args.trace)

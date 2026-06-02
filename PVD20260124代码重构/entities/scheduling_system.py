@@ -18,7 +18,6 @@ from .scheduling_entities import (
     SchedulingRobot,
     SchedulingEntity
 )
-from domain import WaferService
 from utils import LocationParser
 
 class SchedulingSystem:
@@ -123,7 +122,7 @@ class SchedulingSystem:
         """
         
         wafer = SchedulingWafer(base_wafer)
-        wafer.current_location_id = WaferService.get_foup_location_id(wafer)
+        wafer.current_location_id = wafer.foup_location_id
         self.wafers[base_wafer.wafer_id] = wafer
         return wafer
 

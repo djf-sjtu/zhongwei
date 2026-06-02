@@ -6,18 +6,18 @@
 """
 from .logger_utils import LogIcon, setup_logger, ChamberNameFormatter
 from .job_merger import MergedJob, merge_jobs
-from .wafer_priority import WaferPriorityCalculator
+from . import trace_writer
 
 __all__ = [
     # 日志工具
     'LogIcon',
     'setup_logger',
     'ChamberNameFormatter',
-    
+
     # Job合并
     'MergedJob',
     'merge_jobs',
-    
-    # 优先级计算
-    'WaferPriorityCalculator',
+
+    # 等价性 trace
+    'trace_writer',
 ]

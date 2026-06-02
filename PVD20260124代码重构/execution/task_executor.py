@@ -11,8 +11,7 @@ import logging
 from entities import SchedulingChamber, SchedulingAligner, SchedulingWafer, ChamberTask
 from config import ConfigService
 from utils import LocationParser
-from domain import WaferService
-from common import LogIcon
+from common import LogIcon, trace_writer
 
 
 class TaskExecutor:
@@ -94,6 +93,15 @@ class TaskExecutor:
             logging.info(f"{LogIcon.PROCESS} 开始加工: Wafer {task.wafer_id}: "
                         f"在{chamber.location_id}加工，时长{task.duration:.1f}s")
             logging.info(f"57 {chamber.location_id} Slot1 INFO System Launched {task.task_type} recipe: wafer_process.rcp")
+
+            # 微小偏移确保并发 chamber_task_started trace 事件按 wafer_id 升序排列
+            time.sleep(task.wafer_id % 1000 * 0.01)
+            # 等价性 trace：chamber 任务启动（确认 wafer 真正进入加工阶段）
+            trace_writer.emit(
+                'chamber_task_started',
+                wafer_id=task.wafer_id,
+                chamber_id=chamber.location_id,
+            )
         else:
             logging.info(f"{LogIcon.MACRO} 开始宏任务：{chamber.location_id} 开始{task.task_type}任务 "
                         f"(时长 {task.duration:.1f}s)")
@@ -115,7 +123,26 @@ class TaskExecutor:
         threading.Thread(target=task_thread, daemon=True).start()
 
     def _on_task_completed(self, chamber: SchedulingChamber, task: ChamberTask):
-        """任务完成回调"""
+        """任务完成回调
+
+        故障穿插语义（v1）：
+        - 如果 chamber 在 fault 状态、且 task 是 wafer_process，把 task 冻结到
+          chamber.frozen_task，不走完成流程；等 unfault_chamber 触发完成。
+        - 如果 chamber.current_task 已不再是当前 task（说明 unfault_chamber 已经
+          抢先调 _complete_wafer_task），本回调 noop。
+        - macro 任务不参与 fault 暂存，照常完成（v1 限制：不处理 fault 时正在跑
+          macro 的情况，行为按"macro 自行跑完"）。
+        """
+        with chamber._fault_lock:
+            # unfault preempt 已经处理过这个 task
+            if chamber.current_task is not task:
+                return
+            # wafer 任务遇上 fault：冻结，等 unfault
+            if chamber.is_faulted and task.task_type == 'wafer_process':
+                chamber.frozen_task = task
+                chamber.current_task = None
+                return
+
         if task.task_type == 'wafer_process':
             self._complete_wafer_task(chamber, task)
         elif task.task_type == 'macro':
@@ -127,6 +154,23 @@ class TaskExecutor:
         chamber.last_task_end_time = time.time()
 
         # 继续处理队列
+        self.process_chamber_queue(chamber)
+
+        # 若 chamber 此时仍完全空闲，尝试从兄弟 chamber 抢活以避免闲置
+        if (task.task_type == 'wafer_process'
+                and not chamber.current_task
+                and not chamber.task_queue):
+            self.scheduler._steal_work_for_idle_chamber(chamber)
+
+    def force_complete_wafer_task(self, chamber: SchedulingChamber, task: ChamberTask):
+        """由外部（如 unfault_chamber）触发的 wafer 任务"立即视为完成"。
+
+        语义等同于 _on_task_completed 内的 wafer_process 分支，但跳过 fault
+        守卫（调用方必须自己保证 chamber 处于可以完成的状态，且 task 已经从
+        chamber 的 current_task / frozen_task 中摘除）。
+        """
+        self._complete_wafer_task(chamber, task)
+        chamber.last_task_end_time = time.time()
         self.process_chamber_queue(chamber)
 
     def _complete_wafer_task(self, chamber: SchedulingChamber, task: ChamberTask):
@@ -160,7 +204,7 @@ class TaskExecutor:
             return 1
 
         base_module = LocationParser.get_base_module_id(chamber.location_id)
-        return WaferService.calculate_film_consumption_from_recipe(
+        return ConfigService.calculate_film_consumption_from_recipe(
             current_step.process_recipe, base_module
         )
 

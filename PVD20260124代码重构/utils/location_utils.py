@@ -122,19 +122,46 @@ class LocationParser:
     def get_z_level_for_location(location_id: str) -> str:
         """
         获取位置对应的Z轴高度
-        
+
         Args:
             location_id: 位置ID
-            
+
         Returns:
             str: Z轴高度 ('CHAMBER' 或 'LL_TBS')
         """
 
         base_module = LocationParser.get_base_module_id(location_id)
-        
+
         # Chamber层
         if ConfigService.is_chamber_module(base_module):
             return "CHAMBER"
-        
+
         # LL_TBS层：FOUP、ALIGNER、LL、TBS都在这一层
         return "LL_TBS"
+
+
+# ================================================================
+# Location 类型谓词：(LocationParser + ConfigService) 的便捷形式。
+# 这些过去封装在 utils/type_checks.py 里，但只是纯转发，没有自己的逻辑，
+# 也不构成独立的 service。和 LocationParser 同居在此处更合理（都基于
+# location_id 解析）。调用方仍可 `from utils import is_chamber` 使用。
+# ================================================================
+
+def is_foup(location_id: str) -> bool:
+    return ConfigService.is_foup_module(LocationParser.get_base_module_id(location_id))
+
+
+def is_ll(location_id: str) -> bool:
+    return ConfigService.is_ll_module(LocationParser.get_base_module_id(location_id))
+
+
+def is_tbs(location_id: str) -> bool:
+    return ConfigService.is_tbs_module(LocationParser.get_base_module_id(location_id))
+
+
+def is_aligner(location_id: str) -> bool:
+    return ConfigService.is_aligner_module(LocationParser.get_base_module_id(location_id))
+
+
+def is_chamber(location_id: str) -> bool:
+    return ConfigService.is_chamber_module(LocationParser.get_base_module_id(location_id))
