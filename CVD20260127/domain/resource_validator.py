@@ -54,9 +54,12 @@ class ResourceValidator:
                     (target_location.booked_wafer_id is None or
                      target_location.booked_wafer_id == wafer.wafer_id))
 
-        # Chamber：必须空闲，且队首任务是该wafer
+        # Chamber：必须空闲、未故障，且队首任务是该wafer
         if is_chamber(target_location_id):
             if target_location.busy != 0:
+                return False
+
+            if getattr(target_location, 'is_faulted', False):
                 return False
 
             if not target_location.task_queue:

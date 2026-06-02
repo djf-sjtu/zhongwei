@@ -585,6 +585,12 @@ class TransportExecutor:
         """TBS到达"""
         def leave_tbs():
             wafer.busy = 0
+            next_task = wafer.assignment_queue[0] if wafer.assignment_queue else None
+            if next_task and next_task.to_location and is_chamber(next_task.to_location):
+                target = self.system.chambers.get(next_task.to_location)
+                if target and (target.busy != 0 or target.is_faulted or target.current_wafer_id is not None):
+                    self.scheduler.add_to_waiting(wafer)
+                    return
             self.scheduler.assign_next_task(wafer)
 
         logging.info(f"{LogIcon.TRANSPORT} Wafer {wafer.wafer_id} 到达 {tbs.location_id}")

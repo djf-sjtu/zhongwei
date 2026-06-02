@@ -15,6 +15,7 @@ CVD平台: 支持批处理wafer
 import time
 import logging
 import random
+import threading
 from models import (
     Wafer, ProcessJob,
     WaferAngle, SlotID, Sequence, SequenceStep, Recipe, RecipeView,
@@ -155,10 +156,11 @@ class SchedulerSimulation:
         recipe = Recipe(recipe_name=f"{recipe_type}_recipe", recipe_views=[])
 
         if job_chambers:
-            # 随机选择两个chambers
-            selected_chambers = random.sample(job_chambers, min(2, len(job_chambers)))
-            # 选择NUC_A、NUC_B
-            #selected_chambers = ['NUC_A', 'NUC_B']
+            # prelot只在NUC腔运行（BULK prelot时长=BULK工艺时间，会严重延迟路径规划）
+            nuc_chambers = [ch for ch in job_chambers
+                            if ConfigService.get_process_type(ch) == 'NUC']
+            pool = nuc_chambers if nuc_chambers else job_chambers
+            selected_chambers = random.sample(pool, min(2, len(pool)))
             for selected_chamber in selected_chambers:
                 # 获取工艺时间
                 process_type = ConfigService.get_process_type(selected_chamber)
@@ -227,9 +229,91 @@ def scenario_1_single_job():
     logging.info("\n=== 场景1: 单个Job（简单工艺） ===")
 
     sim = SchedulerSimulation()
-    job = sim.create_job(job_id=1, sequence_type='basic', wafer_count=15)
+    job = sim.create_job(job_id=1, sequence_type='basic', wafer_count=5)
     sim.run([job])
 
+
+def scenario_2_fault_chamber_basic():
+    """场景2: 单个Job + chamber 故障/恢复（issue #01 验收）"""
+    logging.info("\n=== 场景2: 单个Job + chamber 故障（T=60s）===")
+
+    sim = SchedulerSimulation()
+    job = sim.create_job(job_id=1, sequence_type='basic', wafer_count=5)
+
+    timers = [
+        threading.Timer(60.0,  sim.coordinator.fault_chamber,   args=('BULK_A',)),
+        threading.Timer(180.0, sim.coordinator.unfault_chamber, args=('BULK_A',)),
+    ]
+    for t in timers:
+        t.daemon = True
+        t.start()
+
+    try:
+        sim.run([job])
+    finally:
+        for t in timers:
+            t.cancel()
+
+
+def scenario_3_fault_combined():
+    """场景3: 联合验收 issue #02 重规划 + #03 冻结 + #04 TEMP_PARK
+    两个Job合并(MergedJob)，各6片wafer，t=200s注入 BULK_A 故障，t=600s恢复。
+    - 两个NUC同时填满 → 两个batch同时完成NUC → race → 触发 TEMP_PARK（#04）
+    - t=200s 时 batch1-job1 正在 BULK_A 加工，unfault=600s > 加工完成时间 → 触发冻结（#03）
+    - t=200s 时 batch2 已预订 BULK_A 但还在路上 → 触发重规划（#02）
+    """
+    logging.info("\n=== 场景3: 联合故障验收（#02+#03+#04）===")
+
+    sim = SchedulerSimulation()
+    job1 = sim.create_job(job_id=1, sequence_type='basic', wafer_count=6)
+    job2 = sim.create_job(job_id=2, sequence_type='basic', wafer_count=6)
+    merged = merge_jobs(job1, job2)
+
+    timers = [
+        threading.Timer(200.0, sim.coordinator.fault_chamber,   args=('BULK_A',)),
+        threading.Timer(600.0, sim.coordinator.unfault_chamber, args=('BULK_A',)),
+    ]
+    for t in timers:
+        t.daemon = True
+        t.start()
+
+    try:
+        sim.run([merged])
+    finally:
+        for t in timers:
+            t.cancel()
+
+
+def scenario_4_e2e_rebalance():
+    """场景4: 端到端全流程验收 (#05 unfault重平衡 + #06 E2E)
+    2个Job各6片wafer（MergedJob, 共6个batch），BULK_A故障 t=230s，恢复 t=560s。
+    - preheat≈90s；batch1(1000_1001)在t≈194s进入BULK_A，batch2(2000_2001)进入BULK_B
+    - t=230s: 故障；1002_1003(PM_E pre-booked)重规划→PM_F；2002/2004后续也将路由到PM_F
+    - t≈543s: 1002_1003/1004_1005到达TBS；1002_1003 queue[0]命中→立即发车到PM_F(busy=1)
+               1004_1005 queue[0]是1002_1003 → is_next_step_ready=False → waiting_wafers
+    - t=560s: unfault；PM_E释放frozen_task立即空闲；rebalance找到1004_1005 → 迁回PM_E（#05）
+    - 故障持续330s；PM_E吞吐1000_1001+1004_1005，PM_F吞吐2000_2001+1002_1003+后续batch
+    """
+    logging.info("\n=== 场景4: 端到端全流程验收（#05+#06）===")
+
+    sim = SchedulerSimulation()
+    job1 = sim.create_job(job_id=1, sequence_type='basic', wafer_count=6)
+    job2 = sim.create_job(job_id=2, sequence_type='basic', wafer_count=6)
+    merged = merge_jobs(job1, job2)
+
+    timers = [
+        threading.Timer(230.0, sim.coordinator.fault_chamber,   args=('BULK_A',)),
+        threading.Timer(560.0, sim.coordinator.unfault_chamber, args=('BULK_A',)),
+    ]
+    for t in timers:
+        t.daemon = True
+        t.start()
+
+    try:
+        sim.run([merged])
+    finally:
+        for t in timers:
+            t.cancel()
 
 
 # ================================================================
@@ -237,5 +321,19 @@ def scenario_1_single_job():
 # ================================================================
 
 if __name__ == "__main__":
-    # 运行场景
-    scenario_1_single_job()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="CVD 调度仿真器")
+    parser.add_argument(
+        '--scenario', type=int, default=1, choices=[1, 2, 3, 4],
+        help='场景编号（1=单Job, 2=单Job+chamber故障, 3=联合故障验收, 4=端到端重平衡验收）'
+    )
+    args = parser.parse_args()
+
+    scenarios = {
+        1: scenario_1_single_job,
+        2: scenario_2_fault_chamber_basic,
+        3: scenario_3_fault_combined,
+        4: scenario_4_e2e_rebalance,
+    }
+    scenarios[args.scenario]()

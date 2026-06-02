@@ -140,15 +140,15 @@ class ConfigService:
     def get_process_time(process_type: str, default: float = 60.0) -> float:
         """
         获取工艺处理时间
-        
+
         Args:
             process_type: 工艺类型
             default: 默认时间
-            
+
         Returns:
             float: 处理时间（秒）
         """
-        return SystemConfig.PROCESS_TIMES.get(process_type, default)
+        return SystemConfig.PROCESS_TIMES.get(process_type, default) * SystemConfig.TIME_SCALE
 
     @staticmethod
     def get_film_consumption(process_type: str) -> int:
@@ -226,27 +226,27 @@ class ConfigService:
     @staticmethod
     def get_cooling_time() -> float:
         """获取冷却时间"""
-        return SystemConfig.COOLING_TIME_SECONDS
+        return SystemConfig.COOLING_TIME_SECONDS * SystemConfig.TIME_SCALE
 
     @staticmethod
     def get_aligner_process_time() -> float:
         """获取Aligner处理时间"""
-        return SystemConfig.ALIGNER_CONFIG['process_time_seconds']
+        return SystemConfig.ALIGNER_CONFIG['process_time_seconds'] * SystemConfig.TIME_SCALE
 
     @staticmethod
     def get_dry_pump_time() -> float:
         """获取抽真空时间"""
-        return SystemConfig.DRY_PUMP_CONFIG['pump_time_seconds']
+        return SystemConfig.DRY_PUMP_CONFIG['pump_time_seconds'] * SystemConfig.TIME_SCALE
 
     @staticmethod
     def get_vent_time() -> float:
         """获取破真空时间"""
-        return SystemConfig.DRY_PUMP_CONFIG['vent_time_seconds']
+        return SystemConfig.DRY_PUMP_CONFIG['vent_time_seconds'] * SystemConfig.TIME_SCALE
 
     @staticmethod
     def get_z_move_time() -> float:
         """获取Z轴移动时间"""
-        return SystemConfig.Z_MOVE_TIME
+        return SystemConfig.Z_MOVE_TIME * SystemConfig.TIME_SCALE
 
     @staticmethod
     def get_pick_place_time() -> float:

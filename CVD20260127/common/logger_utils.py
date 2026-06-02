@@ -47,16 +47,29 @@ class ChamberNameFormatter(logging.Formatter):
 
 def setup_logger():
     """配置日志系统"""
-    # 创建自定义格式化器
+    import os
+    from datetime import datetime
+    from pathlib import Path
+
     formatter = ChamberNameFormatter(
         fmt='%(asctime)s.%(msecs)03d | %(message)s',
         datefmt='%H:%M:%S'
     )
 
-    # 配置根日志记录器
-    handler = logging.StreamHandler()
-    handler.setFormatter(formatter)
-
     logging.root.handlers = []
-    logging.root.addHandler(handler)
     logging.root.setLevel(logging.INFO)
+
+    # 控制台输出
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logging.root.addHandler(console_handler)
+
+    # 文件输出：logs/YYYYMMDD_HHMMSS.log
+    log_dir = Path(__file__).parent.parent / 'logs'
+    log_dir.mkdir(exist_ok=True)
+    log_path = log_dir / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    file_handler = logging.FileHandler(log_path, encoding='utf-8')
+    file_handler.setFormatter(formatter)
+    logging.root.addHandler(file_handler)
+
+    logging.info(f"日志文件: {log_path}")

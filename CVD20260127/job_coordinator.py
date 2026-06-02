@@ -39,6 +39,7 @@ class JobCoordinator:
 
         # 依赖注入
         self.scheduler_core.transport_service = self.transport_executor
+        self.scheduler_core.path_planner = self.path_planner
         self.transport_executor.task_executor = self.task_executor
 
         # 回调注入
@@ -147,6 +148,22 @@ class JobCoordinator:
         self.current_job = job
         self.current_job_wafer_index = 0
         self._load_next_wafer()
+
+        # 对 MergedJob：强制从另一个子job加载，确保两个NUC同时填满
+        from common import MergedJob
+        if isinstance(job, MergedJob):
+            # 检查第一次装载选了哪个job，从另一个job强制装载
+            loaded_job1 = (job._job1_index > 0)
+            if loaded_job1 and job._job2_index < len(job._job2.wafer_collection):
+                wafer_base = job._job2.wafer_collection[job._job2_index]
+                job.mark_wafer_loaded("job2")
+                logging.info(f"{LogIcon.PLAN} 并行装载(初始): 强制从job2装载 Wafer {wafer_base.wafer_id}")
+                self._start_wafer(wafer_base)
+            elif not loaded_job1 and job._job1_index < len(job._job1.wafer_collection):
+                wafer_base = job._job1.wafer_collection[job._job1_index]
+                job.mark_wafer_loaded("job1")
+                logging.info(f"{LogIcon.PLAN} 并行装载(初始): 强制从job1装载 Wafer {wafer_base.wafer_id}")
+                self._start_wafer(wafer_base)
 
         logging.info(f"Job {job.process_job_id} 准备完成")
         return True
@@ -279,14 +296,16 @@ class JobCoordinator:
             best_wafer = job.wafer_collection[self.current_job_wafer_index]
             self.current_job_wafer_index += 1
 
-        # 添加wafer到系统并规划路径
-        wafer = self.system.add_wafer(best_wafer)
+        self._start_wafer(best_wafer)
+
+    def _start_wafer(self, wafer_base):
+        """将wafer加入系统、规划路径并定时加入等待队列"""
+        wafer = self.system.add_wafer(wafer_base)
 
         if not self.path_planner.plan_wafer_route_from_foup(wafer):
             logging.error(f"{LogIcon.ERROR} Wafer {wafer.wafer_id} 路径规划失败")
             return
 
-        # 定时启动装载
         delay = max(wafer.scheduled_leave_time - time.time(), 0)
 
         def start_loading():
@@ -353,3 +372,54 @@ class JobCoordinator:
                 for rid, r in self.system.robots.items()
             }
         }
+
+    # ================================================================
+    # 故障管理
+    # ================================================================
+
+    def fault_chamber(self, chamber_id: str) -> bool:
+        """将 chamber 标记为故障，并为所有受影响 wafer 重规划"""
+        chamber = self.system.chambers.get(chamber_id)
+        if not chamber:
+            logging.warning(f"fault_chamber: 找不到 chamber {chamber_id}")
+            return False
+
+        with chamber._fault_lock:
+            chamber.is_faulted = True
+
+        logging.warning(f"⚠️ Chamber 故障: {chamber_id}")
+
+        # 为在该 chamber 有预订的 wafer 重规划
+        affected = [
+            self.system.wafers.get(t.wafer_id)
+            for t in chamber.task_queue
+            if t.task_type == 'wafer_process' and t.wafer_id is not None
+        ]
+        replanned = 0
+        for wafer in affected:
+            if wafer and self.path_planner.replan_for_faulted_chamber(wafer, chamber_id):
+                replanned += 1
+        if replanned:
+            logging.info(f"{LogIcon.PLAN} 故障重规划完成：{replanned} 片 wafer 改道")
+        return True
+
+    def unfault_chamber(self, chamber_id: str) -> bool:
+        """恢复 chamber，重新接受 wafer"""
+        chamber = self.system.chambers.get(chamber_id)
+        if not chamber:
+            logging.warning(f"unfault_chamber: 找不到 chamber {chamber_id}")
+            return False
+
+        with chamber._fault_lock:
+            chamber.is_faulted = False
+
+        logging.info(f"✅ Chamber 故障修复: {chamber_id}")
+
+        # 处理冻结任务：故障期间完成加工但被冻结的 wafer 现在继续流转
+        if chamber.frozen_task:
+            self.task_executor.release_frozen_task(chamber)
+
+        # 重平衡：将被迫改道的 wafer 迁回恢复的 chamber
+        self.path_planner._rebalance_after_unfault(chamber_id)
+
+        return True

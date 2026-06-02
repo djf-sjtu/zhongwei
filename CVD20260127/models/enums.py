@@ -40,6 +40,7 @@ class ModuleID(Enum):
 
     # Aligner模块
     ALIGNER_A = "ALIGNER_A"
+    ALIGNER_B = "ALIGNER_B"
 
     # Robot模块
     EFEM = "EFEM"

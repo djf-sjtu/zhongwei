@@ -113,6 +113,12 @@ class TaskExecutor:
     def _on_task_completed(self, chamber: SchedulingChamber, task: ChamberTask):
         """任务完成回调"""
         if task.task_type == 'wafer_process':
+            with chamber._fault_lock:
+                if chamber.is_faulted:
+                    # chamber 故障中：冻结任务，保持 current_task 非空阻止新任务进入
+                    chamber.frozen_task = task
+                    logging.warning(f"❄️ Wafer {task.wafer_id} 任务冻结（chamber 故障中）: {chamber.location_id}")
+                    return
             self._complete_wafer_task(chamber, task)
         elif task.task_type == 'macro':
             self._complete_macro_task(chamber, task)
@@ -123,6 +129,18 @@ class TaskExecutor:
         chamber.last_task_end_time = time.time()
 
         # 继续处理队列
+        self.process_chamber_queue(chamber)
+
+    def release_frozen_task(self, chamber: SchedulingChamber):
+        """解冻任务，触发 wafer 继续流转（unfault 时调用）"""
+        task = chamber.frozen_task
+        if not task:
+            return
+        chamber.frozen_task = None
+        logging.info(f"🔓 解冻 Wafer {task.wafer_id}，继续流转: {chamber.location_id}")
+        self._complete_wafer_task(chamber, task)
+        chamber.current_task = None
+        chamber.last_task_end_time = time.time()
         self.process_chamber_queue(chamber)
 
     def _complete_wafer_task(self, chamber: SchedulingChamber, task: ChamberTask):

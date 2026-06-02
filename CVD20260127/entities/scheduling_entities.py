@@ -5,6 +5,7 @@
 职责：状态管理，不包含复杂业务逻辑
 """
 import time
+import threading
 from typing import Optional, List
 from dataclasses import dataclass
 
@@ -135,6 +136,11 @@ class SchedulingChamber(SchedulingEntity):
 
         # 处理历史
         self.processing_history: List[tuple] = []
+
+        # 故障状态
+        self.is_faulted: bool = False
+        self.frozen_task: Optional[ChamberTask] = None
+        self._fault_lock = threading.Lock()
 
     def needs_dry_cleaning(self) -> bool:
         """检查是否需要干洗"""

@@ -184,20 +184,37 @@ class PathPlanner:
             return self._find_best_chamber(step.target_modules)
 
     def _find_aligner_for_wafer(self, wafer: SchedulingWafer) -> Optional[str]:
-        """根据wafer angle查找Aligner (CVD: 不使用槽位后缀)"""
+        """根据wafer angle查找最空闲的Aligner (CVD: 不使用槽位后缀)"""
         angle = wafer.base.angle.value
+        aligner_duration = ConfigService.get_aligner_process_time()
+        best_id = None
+        best_ready_time = float('inf')
         for aligner_id, config in SystemConfig.ALIGNER_MODULES.items():
-            if config['angle'] == angle:
-                # CVD: 直接返回模块名，不添加_1后缀
-                return aligner_id
-        return None
+            if config['angle'] != angle:
+                continue
+            aligner = self.system.aligners.get(aligner_id)
+            if not aligner:
+                continue
+            if aligner.busy == 0 and aligner.booked_wafer_id is None:
+                ready_time = time.time()  # 真正空闲
+            else:
+                elapsed = (time.time() - aligner.current_wafer_start_time
+                           if aligner.current_wafer_start_time else 0.0)
+                remaining = max(aligner_duration - elapsed, 0.0)
+                ready_time = time.time() + remaining
+            if ready_time < best_ready_time:
+                best_ready_time = ready_time
+                best_id = aligner_id
+        return best_id
 
     def _find_best_chamber(self, target_modules) -> Optional[str]:
         """查找最佳Chamber（最早可用）"""
         candidate_chambers = [
             c for c in self.system.chambers.values()
             if any(LocationParser.get_base_module_id(c.location_id) == module_id_to_str(mid)
-                   for mid in target_modules) and c.base.online == 1
+                   for mid in target_modules)
+            and c.base.online == 1
+            and not c.is_faulted
         ]
 
         if not candidate_chambers:
@@ -269,9 +286,19 @@ class PathPlanner:
             current_location = step.location_id
 
     def _reserve_chamber_slots(self, wafer: SchedulingWafer, path_plan: List[PathStep]):
-        """预订Chamber时间槽"""
+        """预订Chamber时间槽，同时预订Aligner"""
         for step in path_plan:
-            if not step.location_id or step.location_id not in self.system.chambers:
+            if not step.location_id:
+                continue
+
+            # Aligner预订：防止后续wafer重复选择同一Aligner
+            if step.location_id in self.system.aligners:
+                aligner = self.system.aligners[step.location_id]
+                if aligner.booked_wafer_id is None:
+                    aligner.booked_wafer_id = wafer.wafer_id
+                continue
+
+            if step.location_id not in self.system.chambers:
                 continue
 
             chamber = self.system.chambers[step.location_id]
@@ -425,3 +452,234 @@ class PathPlanner:
             departure = time.strftime('%H:%M:%S', time.localtime(step.estimated_departure))
             location = step.location_id if step.location_id else '待定'
             logging.info(f"    {i}. {step.process_type:8} @ {location:15} {arrival} → {departure}")
+
+    # ================================================================
+    # 故障重规划
+    # ================================================================
+
+    def replan_for_faulted_chamber(self, wafer: SchedulingWafer, faulted_chamber_id: str) -> bool:
+        """将 wafer 从故障 chamber 重规划到最佳替代 chamber"""
+
+        # 1. 找故障步骤
+        fault_idx = next(
+            (i for i, s in enumerate(wafer.path_plan) if s.location_id == faulted_chamber_id),
+            None
+        )
+        if fault_idx is None:
+            return False
+
+        # 已处理完该步骤，无需重规划
+        if fault_idx < wafer.current_step_index:
+            return False
+
+        fault_step = wafer.path_plan[fault_idx]
+        process_type = fault_step.process_type
+
+        # 2. 选替代 chamber（同工艺，online，非故障）
+        candidates = [
+            c for c in self.system.chambers.values()
+            if ConfigService.get_process_type(c.location_id) == process_type
+            and c.base.online == 1
+            and not c.is_faulted
+            and c.location_id != faulted_chamber_id
+        ]
+        if not candidates:
+            logging.warning(f"重规划失败: Wafer {wafer.wafer_id} 无可用 {process_type} chamber")
+            return False
+
+        new_chamber = min(candidates, key=lambda c: self._get_chamber_ready_time(c))
+        new_chamber_id = new_chamber.location_id
+
+        # 3. 计算新时间（自然到达时间，不做 chamber_ready_time 级联调整）
+        if fault_idx > 0:
+            prev_location = wafer.path_plan[fault_idx - 1].location_id
+            prev_departure = wafer.path_plan[fault_idx - 1].estimated_departure
+        else:
+            prev_location = wafer.current_location_id
+            prev_departure = time.time()
+
+        transport_time = calc_transport_time(prev_location, new_chamber_id)
+        new_arrival = prev_departure + transport_time
+        new_process_time = ConfigService.get_process_time(process_type)
+        new_departure = new_arrival + new_process_time
+        time_diff = new_departure - fault_step.estimated_departure
+
+        # 4. 先更新 path_plan（_get_chamber_ready_time 依赖 path_plan，需先更新）
+        wafer.path_plan[fault_idx].location_id = new_chamber_id
+        wafer.path_plan[fault_idx].estimated_arrival = new_arrival
+        wafer.path_plan[fault_idx].estimated_departure = new_departure
+
+        if abs(time_diff) > 0.1:
+            for i in range(fault_idx + 1, len(wafer.path_plan)):
+                wafer.path_plan[i].estimated_arrival += time_diff
+                wafer.path_plan[i].estimated_departure += time_diff
+
+        # 5. 清除故障 chamber 上的预订
+        faulted_chamber = self.system.chambers.get(faulted_chamber_id)
+        if faulted_chamber:
+            faulted_chamber.task_queue = [
+                t for t in faulted_chamber.task_queue
+                if not (t.task_type == 'wafer_process'
+                        and t.wafer_id == wafer.wafer_id
+                        and isinstance(t.task_id, str)
+                        and t.task_id.startswith('reserve_'))
+            ]
+
+        # 6. 按 estimated_arrival sorted insert 到新 chamber
+        new_task = ChamberTask(
+            task_id=f"reserve_{wafer.wafer_id}_{new_chamber_id}",
+            task_type='wafer_process',
+            wafer_id=wafer.wafer_id,
+            duration=new_process_time
+        )
+        insert_pos = len(new_chamber.task_queue)
+        for i, t in enumerate(new_chamber.task_queue):
+            if t.task_type == 'wafer_process':
+                other_wafer = self.system.wafers.get(t.wafer_id)
+                if other_wafer:
+                    other_arrival = next(
+                        (s.estimated_arrival for s in other_wafer.path_plan
+                         if s.location_id == new_chamber_id),
+                        float('inf')
+                    )
+                    if other_arrival > new_arrival:
+                        insert_pos = i
+                        break
+        new_chamber.task_queue.insert(insert_pos, new_task)
+
+        # 7. 更新 assignment_queue 中指向故障 chamber 的任务，同步更新紧后一条的 from_location
+        for i, task in enumerate(wafer.assignment_queue):
+            if task.to_location == faulted_chamber_id:
+                task.to_location = new_chamber_id
+                if i + 1 < len(wafer.assignment_queue):
+                    wafer.assignment_queue[i + 1].from_location = new_chamber_id
+                break
+
+        # 8. 级联更新同 new_chamber 队列中的后续 wafer
+        self.update_affected_wafers_in_chambers(wafer, fault_idx + 1)
+
+        logging.info(f"{LogIcon.PLAN} 重规划: Wafer {wafer.wafer_id} "
+                     f"故障 chamber {faulted_chamber_id} → {new_chamber_id} (step {fault_idx})")
+        return True
+
+    def temp_park_wafer(self, wafer: SchedulingWafer, insert_step_idx: int) -> bool:
+        """将 wafer 临时停靠到空闲 TBS，释放当前 chamber 暂存占用"""
+        # 找空闲 TBS（未占用、未预订），跳过 wafer 当前所在的 TBS
+        current_tbs = wafer.current_location_id
+        park_location = None
+        for tbs_id in sorted(self.system.tbs_locations):
+            if tbs_id == current_tbs:
+                continue
+            tbs = self.system.tbs_locations[tbs_id]
+            if tbs.busy == 0 and tbs.booked_wafer_id is None:
+                park_location = tbs_id
+                break
+
+        if park_location is None:
+            return False
+
+        # 预订 TBS，防止其他 wafer 抢占
+        tbs = self.system.get_tbs(park_location)
+        if tbs:
+            tbs.booked_wafer_id = wafer.wafer_id
+
+        # 出发位置：path_plan 前一步的 location，或当前位置
+        if insert_step_idx > 0:
+            prev_location = wafer.path_plan[insert_step_idx - 1].location_id or wafer.current_location_id
+        else:
+            prev_location = wafer.current_location_id
+
+        # 插入 TEMP_PARK PathStep
+        park_step = PathStep(
+            process_type='TEMP_PARK',
+            location_id=park_location,
+            estimated_arrival=time.time(),
+            estimated_departure=time.time(),
+        )
+        wafer.path_plan.insert(insert_step_idx, park_step)
+
+        # 在 assignment_queue 对应位置插入传输任务
+        queue_idx = insert_step_idx - wafer.current_step_index
+        park_task = TransportTask(
+            wafer_id=wafer.wafer_id,
+            from_location=prev_location,
+            to_location=park_location,
+        )
+        wafer.assignment_queue.insert(queue_idx, park_task)
+
+        # 更新紧后任务的 from_location
+        if queue_idx + 1 < len(wafer.assignment_queue):
+            wafer.assignment_queue[queue_idx + 1].from_location = park_location
+
+        logging.info(f"{LogIcon.PLAN} TEMP_PARK: Wafer {wafer.wafer_id} → {park_location} "
+                     f"（等待目标 chamber 就绪）")
+        return True
+
+    def _estimate_arrival(self, wafer: SchedulingWafer, target_location: str) -> float:
+        """实时估算 wafer 到达 target_location 的时间（比 path_plan 时间戳更准确）"""
+        current_time = time.time()
+        current_chamber = self.system.chambers.get(wafer.current_location_id)
+        if (current_chamber and current_chamber.current_task and
+                current_chamber.current_task.wafer_id == wafer.wafer_id and
+                current_chamber.task_start_time):
+            remaining = current_chamber.current_task.duration - (
+                current_time - current_chamber.task_start_time
+            )
+            from_time = current_time + max(remaining, 0)
+        else:
+            from_time = current_time
+        return from_time + calc_transport_time(wafer.current_location_id, target_location)
+
+    def _rebalance_after_unfault(self, recovered_chamber_id: str):
+        """unfault 后将被迫改道的 wafer 迁回恢复的 chamber（自适应均衡）"""
+        recovered = self.system.chambers.get(recovered_chamber_id)
+        if not recovered:
+            return
+
+        process_type = ConfigService.get_process_type(recovered_chamber_id)
+
+        sibling_ids = {
+            c.location_id for c in self.system.chambers.values()
+            if ConfigService.get_process_type(c.location_id) == process_type
+            and c.location_id != recovered_chamber_id
+        }
+        if not sibling_ids:
+            return
+
+        # 收集所有 wafer（含 FOUP 驻留）中 future path_plan 目标为兄弟 chamber 的候选
+        candidates = []
+        for wafer in list(self.system.wafers.values()):
+            if wafer.busy == 1:
+                continue  # 传输中，跳过
+            for step_idx, step in enumerate(wafer.path_plan):
+                if step_idx < wafer.current_step_index:
+                    continue
+                if step.location_id not in sibling_ids:
+                    continue
+                if wafer.current_location_id == step.location_id:
+                    break  # 已在 sibling 处理中，跳过
+                eta = self._estimate_arrival(wafer, step.location_id)
+                candidates.append((eta, wafer, step.location_id))
+                break
+
+        if not candidates:
+            return
+
+        candidates.sort(key=lambda x: x[0])  # 按实时 ETA 升序
+
+        # 逐一迁移：recovered 比 sibling 更快才迁，自然均衡后停止
+        migrated = 0
+        for _eta, wafer, sibling_id in candidates:
+            sibling = self.system.chambers.get(sibling_id)
+            if not sibling:
+                continue
+            if self._get_chamber_ready_time(recovered) >= self._get_chamber_ready_time(sibling):
+                break  # recovered 已不比 sibling 更快，后续候选也不必迁
+            if self.replan_for_faulted_chamber(wafer, sibling_id):
+                logging.info(f"{LogIcon.PLAN} unfault 重调度: Wafer {wafer.wafer_id} "
+                             f"{sibling_id} → {recovered_chamber_id}")
+                migrated += 1
+                recovered = self.system.chambers.get(recovered_chamber_id)  # 刷新 ready_time
+
+        if migrated:
+            logging.info(f"✅ unfault 重平衡完成: {migrated} 片 wafer 迁回 {recovered_chamber_id}")
