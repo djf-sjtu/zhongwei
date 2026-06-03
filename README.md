@@ -1,16 +1,6 @@
 # 中威半导体调度仿真器
 
 PVD / CVD 平台调度系统仿真，纯 Python，无第三方依赖，直接用系统解释器运行。
-
----
-
-## 目录结构
-
-```
-CVD20260127/        CVD 平台（批处理 wafer，双臂 TMB 机械臂）
-PVD20260124代码重构/ PVD 平台（单片 wafer，单臂 TM 机械臂）
-```
-
 两个平台架构相同，配置和部分执行逻辑有差异。
 
 ---
@@ -19,11 +9,11 @@ PVD20260124代码重构/ PVD 平台（单片 wafer，单臂 TM 机械臂）
 
 ```bash
 # CVD
-cd CVD20260127
+cd CVD
 python3 main_scheduler.py --scenario <N>
 
 # PVD
-cd PVD20260124代码重构
+cd PVD
 python3 main_scheduler.py --scenario <N>
 ```
 

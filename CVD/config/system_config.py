@@ -36,7 +36,7 @@ class SystemConfig:
         'NUC_B': {'zone': 'TMA', 'process_type': 'NUC'},
         'BULK_A': {'zone': 'TMB', 'process_type': 'BULK'},
         'BULK_B': {'zone': 'TMB', 'process_type': 'BULK'},
-        'BULK_C': {'zone': 'TMB', 'process_type': 'BULK'},  # 暂时注释
+        'BULK_C': {'zone': 'TMB', 'process_type': 'BULK'},  
     }
 
     # LL配置
