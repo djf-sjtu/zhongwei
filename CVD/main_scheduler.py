@@ -187,6 +187,7 @@ class SchedulerSimulation:
         logging.info(f"{'=' * 80}\n")
 
         start_time = time.time()
+        self.coordinator.metrics.start()
 
         # 添加Job到队列
         self.coordinator.job_queue = jobs
@@ -205,6 +206,8 @@ class SchedulerSimulation:
 
         # 停止系统
         self.coordinator.stop_system()
+        self.coordinator.metrics.refresh_open_storage(self.coordinator.system)
+        self.coordinator.metrics.finish()
 
         # 输出统计
         end_time = time.time()
@@ -218,6 +221,7 @@ class SchedulerSimulation:
         logging.info(f"Wafer总数: {sum(len(j.wafer_collection) for j in jobs)}")
         logging.info(f"调度周期数: {self.coordinator.stats['total_cycles']}")
         logging.info(f"{'=' * 80}\n")
+        self.coordinator.metrics.log_summary()
 
 
 # ================================================================

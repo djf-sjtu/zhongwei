@@ -17,7 +17,7 @@ from services.planning import PathPlanner
 from services.scheduling import SchedulerCore, ResourceSelector
 from execution import TransportExecutor, TaskExecutor, MacroManager
 from config import SystemConfig, ConfigService
-from common import LogIcon
+from common import LogIcon, FaultMetrics
 from models import module_id_to_str
 
 
@@ -27,11 +27,14 @@ class JobCoordinator:
     def __init__(self):
         # 系统
         self.system = SchedulingSystem()
+        self.metrics = FaultMetrics()
 
         # 服务层初始化（自下而上）
         self.resource_selector = ResourceSelector(self.system)
         self.scheduler_core = SchedulerCore(self.system, self.resource_selector)
         self.path_planner = PathPlanner(self.system)
+        self.scheduler_core.metrics = self.metrics
+        self.path_planner.metrics = self.metrics
         
         self.task_executor = TaskExecutor(self.system, self.scheduler_core)
         self.transport_executor = TransportExecutor(self.system, self.scheduler_core, self.path_planner)
@@ -219,6 +222,8 @@ class JobCoordinator:
         """Wafer完成回调"""
         from common import MergedJob
 
+        self.metrics.on_wafer_completed(wafer.wafer_id)
+
         if not self.current_job:
             return
 
@@ -388,20 +393,38 @@ class JobCoordinator:
             chamber.is_faulted = True
 
         logging.warning(f"⚠️ Chamber 故障: {chamber_id}")
+        for wafer in self.system.wafers.values():
+            if wafer.current_location_id == chamber_id:
+                self.metrics.ignore_wafer(wafer.wafer_id)
+        self.metrics.snapshot('faulted', chamber_id)
 
-        # 为在该 chamber 有预订的 wafer 重规划
+        process_type = ConfigService.get_process_type(chamber_id)
+        strategy = SystemConfig.SCHEDULING_CONFIG.get('fault_replan_strategy', 'continuity_pool')
+        if strategy == 'legacy_direct':
+            replanned = self._legacy_replan_faulted_chamber(chamber_id)
+        else:
+            replanned = self.path_planner.replan_process_type_for_fault(process_type, chamber_id)
+        if replanned:
+            logging.info(f"{LogIcon.PLAN} 故障工艺池重规划完成：{replanned} 片 wafer 重排")
+        return True
+
+    def _legacy_replan_faulted_chamber(self, chamber_id: str) -> int:
+        """Original behavior: only reroute wafers reserved on the failed chamber."""
+        chamber = self.system.chambers.get(chamber_id)
+        if not chamber:
+            return 0
         affected = [
             self.system.wafers.get(t.wafer_id)
             for t in chamber.task_queue
             if t.task_type == 'wafer_process' and t.wafer_id is not None
         ]
+        considered = [wafer.wafer_id for wafer in affected if wafer]
+        self.metrics.on_fault_candidates(chamber_id, considered)
         replanned = 0
         for wafer in affected:
             if wafer and self.path_planner.replan_for_faulted_chamber(wafer, chamber_id):
                 replanned += 1
-        if replanned:
-            logging.info(f"{LogIcon.PLAN} 故障重规划完成：{replanned} 片 wafer 改道")
-        return True
+        return replanned
 
     def unfault_chamber(self, chamber_id: str) -> bool:
         """恢复 chamber，重新接受 wafer"""
@@ -419,7 +442,13 @@ class JobCoordinator:
         if chamber.frozen_task:
             self.task_executor.release_frozen_task(chamber)
 
-        # 重平衡：将被迫改道的 wafer 迁回恢复的 chamber
-        self.path_planner._rebalance_after_unfault(chamber_id)
+        self.metrics.snapshot('before_unfault_rebalance', chamber_id)
+
+        # 重平衡：恢复同工艺产能后，按连续性目标重新规划剩余路径
+        process_type = ConfigService.get_process_type(chamber_id)
+        strategy = SystemConfig.SCHEDULING_CONFIG.get('fault_replan_strategy', 'continuity_pool')
+        if strategy != 'legacy_direct':
+            self.path_planner.rebalance_process_type_after_unfault(process_type)
+        self.metrics.snapshot('after_unfault_rebalance', chamber_id)
 
         return True

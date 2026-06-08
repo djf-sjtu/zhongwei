@@ -32,9 +32,10 @@ class SchedulerCore:
 
         # Wafer正忙，加入等待队列
         if wafer.busy == 1:
-            logging.warning(f"{LogIcon.PLAN} Wafer {wafer.wafer_id} 正忙，无法分配任务")
-            self.add_to_waiting(wafer)
             return
+
+        if wafer in self.system.waiting_wafers:
+            self.system.waiting_wafers.remove(wafer)
 
         # 动态选择目标位置（如果需要）
         next_task = wafer.assignment_queue[0]
@@ -68,6 +69,9 @@ class SchedulerCore:
     def check_waiting_wafers(self):
         """检查等待队列"""
         for wafer in list(self.system.waiting_wafers):
+            if wafer.busy == 1:
+                continue
+
             # 无任务，移除
             if not wafer.assignment_queue:
                 self.system.waiting_wafers.remove(wafer)

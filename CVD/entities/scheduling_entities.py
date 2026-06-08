@@ -6,7 +6,7 @@
 """
 import time
 import threading
-from typing import Optional, List
+from typing import Dict, Optional, List
 from dataclasses import dataclass
 
 from models import Wafer, Chamber, module_id_to_str
@@ -80,18 +80,24 @@ class SchedulingWafer(SchedulingEntity):
         self.assignment_queue: List[TransportTask] = []
         self.scheduled_leave_time: Optional[float] = None
         self.path_plan: List[PathStep] = []  # 保存完整的路径规划
+        self.transport_not_before: Dict[int, float] = {}
+        self.active_transport_task: Optional[TransportTask] = None
+        self.active_transport_eta: Optional[float] = None
+        self._temp_park_count: int = 0
 
     def get_current_step(self):
         """获取当前工艺步骤"""
         steps = self.base.associated_sequence.sequence_steps
-        if self.current_step_index < len(steps):
-            return steps[self.current_step_index]
+        adjusted = self.current_step_index - self._temp_park_count
+        if adjusted < len(steps):
+            return steps[adjusted]
         return None
 
     def get_next_step(self):
         """获取下一个工艺步骤"""
         steps = self.base.associated_sequence.sequence_steps
-        next_index = self.current_step_index + 1
+        adjusted = self.current_step_index - self._temp_park_count
+        next_index = adjusted + 1
         if next_index < len(steps):
             return steps[next_index]
         return None
@@ -99,11 +105,15 @@ class SchedulingWafer(SchedulingEntity):
     def is_sequence_completed(self) -> bool:
         """检查是否完成所有工艺"""
         total_steps = len(self.base.associated_sequence.sequence_steps)
-        return self.current_step_index + 1 >= total_steps
+        adjusted = self.current_step_index - self._temp_park_count
+        return adjusted + 1 >= total_steps
 
     def move_to_next_location(self, new_location_id: str):
         """移动到下一个位置"""
         self.current_location_id = new_location_id
+        if (self.current_step_index < len(self.path_plan) and
+                self.path_plan[self.current_step_index].process_type == 'TEMP_PARK'):
+            self._temp_park_count += 1
         self.current_step_index += 1
 
 

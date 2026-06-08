@@ -94,6 +94,8 @@ class TransportExecutor:
                      f"(优先级={priority:.3f}, 队列{len(robot.transport_queue)}个任务)")
 
         robot.transport_queue.pop(idx)
+        if getattr(self.scheduler, 'metrics', None):
+            self.scheduler.metrics.on_transport_started(wafer, task.from_location)
         return task
 
     def _book_location(self, location_id: str, wafer_id: int):
@@ -114,6 +116,13 @@ class TransportExecutor:
             self.system.waiting_wafers.remove(switch_wafer)
             self._execute_switch(robot, task, switch_wafer)
             return
+
+        wafer = self.system.wafers.get(task.wafer_id)
+        if wafer:
+            wafer.active_transport_task = task
+            wafer.active_transport_eta = time.time() + self._estimate_transport_duration(task)
+            if is_chamber(task.from_location):
+                wafer.storage_start_time = None
 
         def transport_thread():
             try:
@@ -141,16 +150,30 @@ class TransportExecutor:
                     self._dropoff_batch(robot, task, wafer,1)
                 else:
                     self._dropoff(robot, task, wafer,1)
+                wafer.active_transport_task = None
+                wafer.active_transport_eta = None
 
             except Exception as e:
                 logging.error(f"{LogIcon.ERROR} 传输错误: {e}")
                 self._clear_booking(task.to_location)
+                wafer = self.system.wafers.get(task.wafer_id)
+                if wafer:
+                    wafer.active_transport_task = None
+                    wafer.active_transport_eta = None
             finally:
                 robot.busy = 0
                 self.process_robot_queue(robot)
 
         robot.busy = 1
         threading.Thread(target=transport_thread, daemon=True).start()
+
+    def _estimate_transport_duration(self, task: TransportTask) -> float:
+        duration = SystemConfig.TRANSPORT_BASE_TIME + SystemConfig.PICK_PLACE_TIME * 2
+        from_z = LocationParser.get_z_level_for_location(task.from_location)
+        to_z = LocationParser.get_z_level_for_location(task.to_location)
+        if from_z != to_z:
+            duration += SystemConfig.Z_MOVE_TIME * 2
+        return duration
 
     # ================================================================
     # swicth
@@ -159,6 +182,8 @@ class TransportExecutor:
     def _find_switch_candidate(self, robot_id: str, task: TransportTask) -> Optional[SchedulingWafer]:
         """查找Switch候选"""
         for wafer in self.system.waiting_wafers:
+            if wafer.busy == 1 or wafer.active_transport_task:
+                continue
             if not wafer.assignment_queue:
                 continue
             task2 = wafer.assignment_queue[0]

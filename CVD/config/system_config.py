@@ -135,6 +135,7 @@ class SystemConfig:
         'scheduling_cycle_interval_seconds': 2.0,  # 调度周期间隔（秒，不缩放）
         'max_retry_attempts': 3,
         'default_cleaning_duration_hours': 2.0,
+        'fault_replan_strategy': 'continuity_pool',
     }
 
     # ================================================================

@@ -152,6 +152,8 @@ class TaskExecutor:
         # 更新wafer状态
         wafer.busy = 0
         wafer.storage_start_time = time.time()
+        if getattr(self.scheduler, 'metrics', None):
+            self.scheduler.metrics.on_process_completed(wafer.wafer_id)
 
         # 消耗膜厚
         film_consumption = self._calculate_film_consumption(wafer, chamber)

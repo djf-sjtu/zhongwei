@@ -4,6 +4,8 @@
 资源验证服务
 职责：验证资源是否就绪（从utils迁移的业务逻辑）
 """
+import time
+
 from utils import is_foup, is_ll, is_tbs, is_aligner, is_chamber
 
 
@@ -29,6 +31,10 @@ class ResourceValidator:
         target_location = system.get_location_by_id(target_location_id)
 
         if not target_location:
+            return False
+
+        not_before = wafer.transport_not_before.get(wafer.current_step_index)
+        if not_before is not None and time.time() < not_before:
             return False
 
         # FOUP：总是ready
