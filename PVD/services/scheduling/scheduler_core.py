@@ -22,6 +22,7 @@ class SchedulerCore:
         self.resource_selector = resource_selector
         self.transport_service = None  # 后续注入
         self.path_planner = None       # 后续注入
+        self.metrics = None
         self._last_warning_times: dict = {}  # wafer_id -> 上次打印暂存警告的时间
 
     def assign_next_task(self, wafer: SchedulingWafer):

@@ -14,7 +14,7 @@ class SystemConfig:
     # 仅用于缩短 wall-clock 仿真耗时，不影响调度决策的相对关系。
     # 改回 1.0 即恢复原速。范围由本文件末尾的白名单显式声明。
     # ================================================================
-    TIME_SCALE = 1.0
+    TIME_SCALE = 0.1
 
     # ================================================================
     # 显示名称配置
@@ -170,6 +170,10 @@ class SystemConfig:
         'max_retry_attempts': 3,
         'cleaning_check_interval_seconds': 10.0,
         'default_cleaning_duration_hours': 2.0,
+        # legacy_direct: only wafers planned to the faulted chamber are rerouted.
+        # continuity_pool: freeze executing prefixes and reuse the normal planner
+        # for every in-system wafer that has not reached the faulted process type.
+        'fault_replan_strategy': 'continuity_pool',
     }
 
     # ================================================================

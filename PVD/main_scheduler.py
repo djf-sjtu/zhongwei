@@ -168,7 +168,7 @@ class SchedulerSimulation:
 
     POLL_INTERVAL_SECONDS = 0.5
 
-    def run(self, jobs: list, trace_path: str = None):
+    def run(self, jobs: list, trace_path: str = None, metrics_path: str = None):
         """运行仿真。trace_path 指定时，把等价性 trace 写到该 JSONL 文件。"""
         if trace_path:
             trace_writer.init_trace(trace_path)
@@ -176,6 +176,8 @@ class SchedulerSimulation:
         try:
             self._run_impl(jobs)
         finally:
+            if metrics_path:
+                self.coordinator.metrics.write_json(metrics_path)
             if trace_path:
                 trace_writer.close_trace()
 
@@ -186,6 +188,7 @@ class SchedulerSimulation:
         logging.info(f"{'=' * 80}\n")
 
         start_time = time.time()
+        self.coordinator.metrics.start()
 
         # 添加Job到队列
         self.coordinator.job_queue = jobs
@@ -204,6 +207,8 @@ class SchedulerSimulation:
 
         # 停止系统
         self.coordinator.stop_system()
+        self.coordinator.metrics.refresh_open_storage(self.coordinator.system)
+        self.coordinator.metrics.finish()
 
         # 输出统计
         end_time = time.time()
@@ -214,32 +219,33 @@ class SchedulerSimulation:
         logging.info(f"{'=' * 80}")
         logging.info(f"总耗时: {duration:.1f}秒")
         logging.info(f"{'=' * 80}\n")
+        self.coordinator.metrics.log_summary()
 
 
 # ================================================================
 # 测试场景
 # ================================================================
 
-def scenario_1_single_job(trace_path: str = None):
+def scenario_1_single_job(trace_path: str = None, metrics_path: str = None):
     """场景1: 单个Job"""
     logging.info("\n=== 场景1: 单个Job（简单工艺） ===")
 
     sim = SchedulerSimulation()
     job = sim.create_job(job_id=1, sequence_type='complex', wafer_count=5)
-    sim.run([job], trace_path=trace_path)
+    sim.run([job], trace_path=trace_path, metrics_path=metrics_path)
 
 
-def scenario_2_sequential_jobs(trace_path: str = None):
+def scenario_2_sequential_jobs(trace_path: str = None, metrics_path: str = None):
     """场景2: 两个顺序Job"""
     logging.info("\n=== 场景2: 两个顺序Job ===")
 
     sim = SchedulerSimulation()
     job1 = sim.create_job(job_id=1, sequence_type='simple', wafer_count=5)
     job2 = sim.create_job(job_id=2, sequence_type='basic', wafer_count=5)
-    sim.run([job1, job2], trace_path=trace_path)
+    sim.run([job1, job2], trace_path=trace_path, metrics_path=metrics_path)
 
 
-def scenario_3_merged_jobs(trace_path: str = None):
+def scenario_3_merged_jobs(trace_path: str = None, metrics_path: str = None):
     """场景3: 合并并行Job"""
     logging.info("\n=== 场景3: 合并并行Job ===")
 
@@ -248,10 +254,10 @@ def scenario_3_merged_jobs(trace_path: str = None):
     job2 = sim.create_job(job_id=2, sequence_type='basic', wafer_count=5)
     #job3 = sim.create_job(job_id=3, sequence_type='complex', wafer_count=5)
     merged_job = merge_jobs(job1, job2)
-    sim.run([merged_job], trace_path=trace_path)
+    sim.run([merged_job], trace_path=trace_path, metrics_path=metrics_path)
 
 
-def scenario_4_fault_chamber_basic(trace_path: str = None):
+def scenario_4_fault_chamber_basic(trace_path: str = None, metrics_path: str = None):
     """场景4: 单个Job + 单次 chamber 故障，演示 #02 重规划 + #03 TEMP_PARK。
 
     故障时间线：
@@ -273,7 +279,7 @@ def scenario_4_fault_chamber_basic(trace_path: str = None):
         t.start()
 
     try:
-        sim.run([job], trace_path=trace_path)
+        sim.run([job], trace_path=trace_path, metrics_path=metrics_path)
     finally:
         for t in timers:
             t.cancel()
@@ -297,6 +303,10 @@ if __name__ == "__main__":
         '--trace', type=str, default=None,
         help='trace JSONL 输出路径（用于重构等价性比对）'
     )
+    parser.add_argument(
+        '--metrics', type=str, default=None,
+        help='metrics JSON 输出路径（用于故障调度验收）'
+    )
     args = parser.parse_args()
 
     scenarios = {
@@ -305,4 +315,4 @@ if __name__ == "__main__":
         3: scenario_3_merged_jobs,
         4: scenario_4_fault_chamber_basic,
     }
-    scenarios[args.scenario](trace_path=args.trace)
+    scenarios[args.scenario](trace_path=args.trace, metrics_path=args.metrics)

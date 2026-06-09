@@ -10,7 +10,7 @@ from typing import List, Tuple, Optional, Dict
 
 from entities import SchedulingWafer, SchedulingChamber, TransportTask, PathStep, ChamberTask
 from config import SystemConfig, ConfigService
-from utils import LocationParser, is_ll, is_tbs
+from utils import LocationParser, is_ll, is_tbs, is_foup, is_chamber
 from models import module_id_to_str
 from common import LogIcon, trace_writer
 
@@ -20,6 +20,7 @@ class PathPlanner:
 
     def __init__(self, system):
         self.system = system
+        self.metrics = None
 
     def plan_wafer_route_from_foup(self, wafer: SchedulingWafer) -> bool:
         """从FOUP规划wafer的完整路径"""
@@ -208,12 +209,386 @@ class PathPlanner:
             wafer_id=wafer.wafer_id,
             new_plan=new_plan,
         )
+        if self.metrics:
+            self.metrics.on_rerouted()
 
         logging.info(
             f"{LogIcon.PLAN} 重规划: Wafer {wafer.wafer_id} 故障 chamber "
             f"{faulted_chamber_id} → {new_chamber_id} (step {fault_step_idx})"
         )
         return True
+
+    def replan_process_type_for_fault(self, process_type: str, faulted_chamber_id: str) -> int:
+        """Replan all safe in-system wafers that have not reached a process type yet."""
+        return self._replan_process_type_pool(
+            process_type=process_type,
+            blocked_chamber_id=faulted_chamber_id,
+            reason='fault',
+        )
+
+    def rebalance_process_type_after_unfault(self, process_type: str) -> int:
+        """Rebalance future reservations after capacity is restored."""
+        return self._replan_process_type_pool(
+            process_type=process_type,
+            blocked_chamber_id=None,
+            reason='unfault',
+        )
+
+    def collect_process_replan_candidates(self, process_type: str, blocked_chamber_id: str = None) -> list:
+        """Collect wafers with a future step for process_type.
+
+        Wafers already inside the blocked chamber are intentionally excluded; their
+        behavior is handled by fault freeze/unfault semantics, not by this replan.
+        """
+        candidates = []
+        for wafer in self.system.wafers.values():
+            if blocked_chamber_id and wafer.current_location_id == blocked_chamber_id:
+                continue
+            active_transport = wafer.active_transport_task
+            if active_transport and active_transport.to_location == blocked_chamber_id:
+                continue
+            step_idx = self._find_future_process_step_index(wafer, process_type)
+            if step_idx is None:
+                continue
+            candidates.append((wafer, step_idx))
+        return candidates
+
+    def _replan_process_type_pool(self, process_type: str, blocked_chamber_id: str, reason: str) -> int:
+        candidates = self.collect_process_replan_candidates(process_type, blocked_chamber_id)
+        if self.metrics and blocked_chamber_id:
+            self.metrics.on_fault_candidates(
+                blocked_chamber_id,
+                [wafer.wafer_id for wafer, _ in candidates],
+            )
+
+        if not candidates:
+            return 0
+
+        replanned = self._replan_remaining_routes(candidates, reason)
+        logging.info(
+            f"{LogIcon.PLAN} {reason} 剩余路径重规划: process={process_type}, "
+            f"候选={len(candidates)}, 成功={replanned}"
+        )
+        return replanned
+
+    def _replan_remaining_routes(self, candidates: list, reason: str) -> int:
+        """Reuse the normal planner from each wafer's earliest mutable boundary."""
+        candidate_ids = {wafer.wafer_id for wafer, _ in candidates}
+        self._remove_replanned_reservations(candidates)
+        self._remove_replanned_robot_tasks(candidate_ids)
+
+        replanned = 0
+        for wafer, fault_step_idx in sorted(candidates, key=self._remaining_route_priority):
+            context = self._get_remaining_route_context(wafer)
+            remaining_steps = self._get_remaining_steps_after_committed(
+                wafer, context['committed_steps']
+            )
+            if not remaining_steps:
+                continue
+
+            old_suffix = wafer.path_plan[context['suffix_idx']:]
+            new_suffix, plan_start_time = self._plan_path_with_timing(
+                wafer,
+                remaining_steps,
+                context['release_time'],
+                start_location=context['start_location'],
+                can_delay_start=context['can_delay_start'],
+            )
+            if not new_suffix:
+                if not wafer.active_transport_task and wafer.busy == 0:
+                    self.temp_park_wafer(wafer, fault_step_idx)
+                continue
+
+            self._apply_remaining_route_plan(
+                wafer,
+                context,
+                old_suffix,
+                new_suffix,
+                plan_start_time,
+                reason,
+            )
+            replanned += 1
+        return replanned
+
+    def _remove_replanned_reservations(self, candidates: list):
+        candidate_ids = {wafer.wafer_id for wafer, _ in candidates}
+        preserved = {
+            (wafer.wafer_id, wafer.active_transport_task.to_location)
+            for wafer, _ in candidates
+            if wafer.active_transport_task
+            and is_chamber(wafer.active_transport_task.to_location)
+        }
+        for chamber in self.system.chambers.values():
+            kept_preserved = set()
+            retained = []
+            for task in chamber.task_queue:
+                is_candidate_reserve = (
+                    task.wafer_id in candidate_ids
+                    and task.task_type == 'wafer_process'
+                    and isinstance(task.task_id, str)
+                    and task.task_id.startswith('reserve_')
+                )
+                key = (task.wafer_id, chamber.location_id)
+                if is_candidate_reserve and key in preserved and key not in kept_preserved:
+                    kept_preserved.add(key)
+                    retained.append(task)
+                elif not is_candidate_reserve:
+                    retained.append(task)
+            chamber.task_queue = retained
+
+    def _remove_replanned_robot_tasks(self, candidate_ids: set):
+        for robot in self.system.robots.values():
+            robot.transport_queue = [
+                task for task in robot.transport_queue
+                if (
+                    task.wafer_id not in candidate_ids
+                    or task is self.system.wafers[task.wafer_id].active_transport_task
+                )
+            ]
+
+    def _remaining_route_priority(self, item):
+        wafer, fault_step_idx = item
+        context = self._get_remaining_route_context(wafer)
+        return (
+            context['priority'],
+            context['release_time'],
+            max(fault_step_idx - wafer.current_step_index, 0),
+            wafer.wafer_id,
+        )
+
+    def _get_remaining_route_context(self, wafer: SchedulingWafer) -> dict:
+        now = time.time()
+        active_transport = wafer.active_transport_task
+        if active_transport:
+            destination_idx = wafer.current_step_index
+            destination_step = wafer.path_plan[destination_idx]
+            destination_step.location_id = active_transport.to_location
+            arrival_time = max(wafer.active_transport_eta or now, now)
+            sequence_step = self._find_sequence_step_for_process(
+                wafer, destination_step.process_type
+            )
+            release_time = max(
+                destination_step.estimated_departure,
+                arrival_time + self._calc_process_time(
+                    destination_step.process_type,
+                    sequence_step,
+                    active_transport.from_location,
+                ),
+            )
+            destination_is_safe = self._is_safe_hold(
+                destination_step.process_type, active_transport.to_location
+            )
+            return {
+                'priority': 1 if is_chamber(active_transport.to_location) else 2,
+                'suffix_idx': destination_idx + 1,
+                'committed_steps': 1,
+                'start_location': active_transport.to_location,
+                'release_time': release_time,
+                'can_delay_start': destination_is_safe,
+                'hold_step_idx': destination_idx,
+            }
+
+        if wafer.current_step_index > 0:
+            wafer.path_plan[wafer.current_step_index - 1].location_id = wafer.current_location_id
+
+        current_chamber = self.system.chambers.get(wafer.current_location_id)
+        if current_chamber:
+            release_time = now
+            if (
+                    current_chamber.current_task
+                    and current_chamber.current_task.wafer_id == wafer.wafer_id
+                    and current_chamber.task_start_time):
+                elapsed = now - current_chamber.task_start_time
+                release_time += max(current_chamber.current_task.duration - elapsed, 0.0)
+            return {
+                'priority': 0,
+                'suffix_idx': wafer.current_step_index,
+                'committed_steps': 0,
+                'start_location': wafer.current_location_id,
+                'release_time': release_time,
+                'can_delay_start': False,
+                'hold_step_idx': (
+                    wafer.current_step_index - 1
+                    if wafer.current_step_index > 0 else None
+                ),
+            }
+
+        current_is_safe = self._is_safe_hold('', wafer.current_location_id)
+        release_time = now
+        hold_step_idx = (
+            wafer.current_step_index - 1
+            if current_is_safe and wafer.current_step_index > 0
+            else None
+        )
+        if wafer.busy == 1 and hold_step_idx is not None:
+            release_time = max(
+                release_time,
+                wafer.path_plan[hold_step_idx].estimated_departure,
+            )
+        return {
+            'priority': 3 if current_is_safe else 2,
+            'suffix_idx': wafer.current_step_index,
+            'committed_steps': 0,
+            'start_location': wafer.current_location_id,
+            'release_time': release_time,
+            'can_delay_start': current_is_safe,
+            'hold_step_idx': hold_step_idx,
+        }
+
+    def _get_remaining_steps_after_committed(
+            self, wafer: SchedulingWafer, committed_steps: int) -> List[Dict]:
+        sequence = wafer.base.associated_sequence
+        adjusted_current = wafer.current_step_index - wafer._temp_park_count
+        start_idx = adjusted_current + 1 + committed_steps
+        remaining = []
+        for i in range(start_idx, len(sequence.sequence_steps)):
+            step = sequence.sequence_steps[i]
+            if step.target_modules:
+                remaining.append({
+                    'step': step,
+                    'process_type': ConfigService.get_process_type(
+                        module_id_to_str(step.target_modules[0])
+                    ),
+                })
+        return remaining
+
+    def _apply_remaining_route_plan(
+            self,
+            wafer: SchedulingWafer,
+            context: dict,
+            old_suffix: list,
+            new_suffix: list,
+            plan_start_time: float,
+            reason: str):
+        suffix_idx = context['suffix_idx']
+        active_transport = wafer.active_transport_task
+        prefix = wafer.path_plan[:suffix_idx]
+        wafer.path_plan = prefix + new_suffix
+
+        if active_transport:
+            wafer.assignment_queue = [active_transport] + self._build_transport_tasks(
+                wafer.wafer_id, context['start_location'], new_suffix
+            )
+        else:
+            wafer.assignment_queue = self._build_transport_tasks(
+                wafer.wafer_id, context['start_location'], new_suffix
+            )
+
+        wafer.transport_not_before = {
+            step_idx: gate
+            for step_idx, gate in wafer.transport_not_before.items()
+            if step_idx < suffix_idx
+        }
+        first_transport_start = plan_start_time
+        if new_suffix:
+            first_transport_start = (
+                new_suffix[0].estimated_arrival
+                - self._calc_transport_time(context['start_location'], new_suffix[0].location_id)
+            )
+        if first_transport_start > context['release_time'] + 0.001:
+            hold_step_idx = context['hold_step_idx']
+            if hold_step_idx is not None:
+                wafer.path_plan[hold_step_idx].estimated_departure = first_transport_start
+            wafer.transport_not_before[suffix_idx] = first_transport_start
+            if is_foup(context['start_location']):
+                wafer.scheduled_leave_time = first_transport_start
+            if self.metrics:
+                protected_chamber = next(
+                    (step.location_id for step in new_suffix if is_chamber(step.location_id)),
+                    '',
+                )
+                self.metrics.on_timing_replan(
+                    wafer.wafer_id,
+                    context['start_location'],
+                    protected_chamber,
+                    first_transport_start - context['release_time'],
+                    plan_change={
+                        'transport_step_idx': suffix_idx,
+                        'hold_departure_before': context['release_time'],
+                        'hold_departure_after': first_transport_start,
+                    },
+                )
+
+        self._reserve_chamber_slots(wafer, new_suffix)
+        if wafer.busy == 0 and not active_transport and wafer not in self.system.waiting_wafers:
+            self.system.waiting_wafers.append(wafer)
+
+        old_locations = [step.location_id for step in old_suffix]
+        new_locations = [step.location_id for step in new_suffix]
+        if old_locations != new_locations:
+            if self.metrics:
+                self.metrics.on_rerouted()
+            trace_writer.emit(
+                'wafer_rerouted',
+                wafer_id=wafer.wafer_id,
+                new_plan=[
+                    {
+                        'step_idx': i,
+                        'process_type': step.process_type,
+                        'location_id': step.location_id or '',
+                    }
+                    for i, step in enumerate(wafer.path_plan)
+                ],
+            )
+        trace_writer.emit(
+            'wafer_remaining_route_replanned',
+            wafer_id=wafer.wafer_id,
+            reason=reason,
+            suffix_idx=suffix_idx,
+        )
+
+    def _build_transport_tasks(
+            self, wafer_id: int, start_location: str, path_plan: List[PathStep]) -> list:
+        tasks = []
+        current_location = start_location
+        for step in path_plan:
+            tasks.append(TransportTask(
+                wafer_id=wafer_id,
+                from_location=current_location,
+                to_location=step.location_id,
+            ))
+            current_location = step.location_id
+        return tasks
+
+    def _find_future_process_step_index(self, wafer: SchedulingWafer, process_type: str):
+        if not wafer.path_plan:
+            return None
+        for i in range(wafer.current_step_index, len(wafer.path_plan)):
+            if wafer.path_plan[i].process_type == process_type:
+                return i
+        return None
+
+    def _get_chambers_for_process(self, process_type: str) -> list:
+        module_ids = ConfigService.get_modules_by_process_type(process_type)
+        return [
+            chamber for chamber in self.system.chambers.values()
+            if LocationParser.get_base_module_id(chamber.location_id) in module_ids
+        ]
+
+    def _get_available_chambers_for_process(self, process_type: str, blocked_chamber_id: str = None) -> list:
+        return [
+            chamber for chamber in self._get_chambers_for_process(process_type)
+            if chamber.base.online == 1
+            and not chamber.is_faulted
+            and chamber.location_id != blocked_chamber_id
+        ]
+
+    def _is_safe_hold(self, process_type: str, location_id: str) -> bool:
+        return (
+            process_type in ('LL', 'TBS', 'FOUP')
+            or is_ll(location_id)
+            or is_tbs(location_id)
+            or is_foup(location_id)
+        )
+
+    def _find_sequence_step_for_process(self, wafer, process_type: str):
+        seq_steps = wafer.base.associated_sequence.sequence_steps
+        return next(
+            (step for step in seq_steps
+             if step.target_modules
+             and ConfigService.get_process_type(module_id_to_str(step.target_modules[0])) == process_type),
+            None,
+        )
 
     def calculate_leave_time_without_reservation(self, wafer_base) -> float:
         """
@@ -244,8 +619,9 @@ class PathPlanner:
         """获取剩余工艺步骤"""
         sequence = wafer.base.associated_sequence
         remaining = []
+        adjusted_current = wafer.current_step_index - wafer._temp_park_count
 
-        for i in range(wafer.current_step_index + 1, len(sequence.sequence_steps)):
+        for i in range(adjusted_current + 1, len(sequence.sequence_steps)):
             step = sequence.sequence_steps[i]
             if step.target_modules:
                 process_type = ConfigService.get_process_type(
@@ -255,12 +631,17 @@ class PathPlanner:
 
         return remaining
 
-    def _plan_path_with_timing(self, wafer: SchedulingWafer, remaining_steps: List[Dict],
-                                start_time: float) -> Tuple[List[PathStep], float]:
-        """规划路径并计算时间"""
-        leave_foup_time = start_time
+    def _plan_path_with_timing(
+            self,
+            wafer: SchedulingWafer,
+            remaining_steps: List[Dict],
+            start_time: float,
+            start_location: str = None,
+            can_delay_start: bool = True) -> Tuple[List[PathStep], float]:
+        """Plan a remaining route from a controllable execution boundary."""
+        plan_start_time = start_time
         relative_time = 0.0
-        current_location = wafer.foup_location_id
+        current_location = start_location or wafer.foup_location_id
         temp_path = []
 
         for step_info in remaining_steps:
@@ -274,11 +655,29 @@ class PathPlanner:
                 logging.error(f"无法为工艺 {process_type} 选择位置")
                 return [], 0.0
 
-            # 检查Chamber约束并调整离开时间
-            if ConfigService.is_chamber_module(LocationParser.get_base_module_id(location_id) if location_id else ''):
-                leave_foup_time = self._adjust_leave_time_for_chamber(
-                    location_id, leave_foup_time, relative_time
-                )
+            # 检查Chamber约束。安全起点可以整体推迟；不可延迟的执行前缀
+            # 则在当前 source 等到目标 chamber 可接收后再启动搬运。
+            is_target_chamber = ConfigService.is_chamber_module(
+                LocationParser.get_base_module_id(location_id) if location_id else ''
+            )
+            if is_target_chamber:
+                if can_delay_start:
+                    plan_start_time = self._adjust_leave_time_for_chamber(
+                        location_id,
+                        plan_start_time,
+                        relative_time,
+                    )
+                else:
+                    chamber = self.system.chambers.get(location_id)
+                    if chamber:
+                        source_ready_time = plan_start_time + relative_time
+                        chamber_ready_time = self._get_chamber_ready_time(chamber)
+                        required_wait = max(0.0, chamber_ready_time - source_ready_time)
+                        if required_wait > 0:
+                            self._move_relative_wait_to_safe_hold(
+                                temp_path, required_wait
+                            )
+                            relative_time += required_wait
 
             # 计算时间
             transport_time = self._calc_transport_time(current_location, location_id or '')
@@ -296,7 +695,28 @@ class PathPlanner:
             current_location = location_id or ''
 
         # 转换为绝对时间的PathStep
-        return self._convert_to_path_steps(temp_path, leave_foup_time), leave_foup_time
+        return self._convert_to_path_steps(temp_path, plan_start_time), plan_start_time
+
+    def _move_relative_wait_to_safe_hold(self, temp_path: List[Dict], wait_time: float):
+        """Move a future chamber wait to the latest planned safe hold if possible."""
+        if not temp_path:
+            return
+
+        hold_idx = None
+        for idx in range(len(temp_path) - 1, -1, -1):
+            item = temp_path[idx]
+            if self._is_safe_hold(item['process_type'], item['location_id']):
+                hold_idx = idx
+                break
+
+        if hold_idx is None:
+            temp_path[-1]['relative_departure'] += wait_time
+            return
+
+        temp_path[hold_idx]['relative_departure'] += wait_time
+        for idx in range(hold_idx + 1, len(temp_path)):
+            temp_path[idx]['relative_arrival'] += wait_time
+            temp_path[idx]['relative_departure'] += wait_time
 
     def _select_location_for_step(self, wafer: SchedulingWafer, step, process_type: str) -> Optional[str]:
         """为工艺步骤选择位置"""
@@ -410,6 +830,8 @@ class PathPlanner:
             wafer.assignment_queue[queue_idx + 1].from_location = park_location
 
         trace_writer.emit('wafer_temp_parked', wafer_id=wafer.wafer_id, park_location=park_location)
+        if self.metrics:
+            self.metrics.on_temp_parked(wafer)
         logging.info(
             f"{LogIcon.PLAN} TEMP_PARK: Wafer {wafer.wafer_id} → {park_location} ({zone} zone)"
         )
@@ -464,8 +886,11 @@ class PathPlanner:
 
         return ready_time
 
-    def _adjust_leave_time_for_chamber(self, chamber_id: str, leave_foup_time: float,
-                                       relative_time: float) -> float:
+    def _adjust_leave_time_for_chamber(
+            self,
+            chamber_id: str,
+            leave_foup_time: float,
+            relative_time: float) -> float:
         """调整离开FOUP时间以匹配Chamber就绪时间"""
         chamber = self.system.chambers.get(chamber_id)
         if not chamber:

@@ -17,7 +17,7 @@ from services.planning import PathPlanner
 from services.scheduling import SchedulerCore, ResourceSelector
 from execution import TransportExecutor, TaskExecutor, MacroManager
 from config import SystemConfig, ConfigService
-from common import LogIcon, trace_writer
+from common import LogIcon, trace_writer, FaultMetrics
 from models import module_id_to_str
 
 
@@ -27,11 +27,14 @@ class JobCoordinator:
     def __init__(self):
         # 系统
         self.system = SchedulingSystem()
+        self.metrics = FaultMetrics()
 
         # 服务层初始化（自下而上）
         self.resource_selector = ResourceSelector(self.system)
         self.scheduler_core = SchedulerCore(self.system, self.resource_selector)
         self.path_planner = PathPlanner(self.system)
+        self.scheduler_core.metrics = self.metrics
+        self.path_planner.metrics = self.metrics
         
         self.task_executor = TaskExecutor(self.system, self.scheduler_core)
         self.transport_executor = TransportExecutor(self.system, self.scheduler_core)
@@ -205,6 +208,7 @@ class JobCoordinator:
 
         # 等价性 trace：wafer 走完整个 sequence 回到 FOUP 的终点事件
         trace_writer.emit('wafer_completed', wafer_id=wafer.wafer_id)
+        self.metrics.on_wafer_completed(wafer.wafer_id)
 
         if not self.current_job:
             return
@@ -355,10 +359,27 @@ class JobCoordinator:
 
         logging.info(f"{LogIcon.WARNING} Chamber 故障: {chamber_id}")
         trace_writer.emit('chamber_faulted', chamber_id=chamber_id)
+        for wafer in self.system.wafers.values():
+            if wafer.current_location_id == chamber_id:
+                self.metrics.ignore_wafer(wafer.wafer_id)
+        self.metrics.snapshot('faulted', chamber_id)
 
-        # 扫所有 in-flight wafer，对下游含故障 chamber 的（且自己不卡在里面的）触发重规划。
-        # 卡在故障 chamber 里的 wafer 不参与（它的出片时间由 unfault 决定）。
+        module_str = chamber_id.rsplit('_', 1)[0]
+        process_type = ConfigService.get_process_type(module_str)
+        strategy = SystemConfig.SCHEDULING_CONFIG.get('fault_replan_strategy', 'continuity_pool')
+        if strategy == 'legacy_direct':
+            affected = self._legacy_replan_faulted_chamber(chamber_id)
+        else:
+            affected = self.path_planner.replan_process_type_for_fault(process_type, chamber_id)
+
+        if affected > 0:
+            logging.info(f"{LogIcon.PLAN} 故障工艺池重规划完成：{affected} 片 wafer 重排")
+        return True
+
+    def _legacy_replan_faulted_chamber(self, chamber_id: str) -> int:
+        """Original direct reroute behavior used for baseline comparison."""
         affected = 0
+        considered = []
         for wafer in list(self.system.wafers.values()):
             if wafer.current_location_id == chamber_id:
                 continue
@@ -370,12 +391,11 @@ class JobCoordinator:
             )
             if not has_downstream_fault:
                 continue
+            considered.append(wafer.wafer_id)
             if self.path_planner.replan_for_faulted_chamber(wafer, chamber_id):
                 affected += 1
-
-        if affected > 0:
-            logging.info(f"{LogIcon.PLAN} 故障重规划完成：{affected} 片 wafer 改道")
-        return True
+        self.metrics.on_fault_candidates(chamber_id, considered)
+        return affected
 
     def unfault_chamber(self, chamber_id: str) -> bool:
         """把 chamber 标记为故障已修复：如果里面卡着 wafer 任务，立即视为完成，
@@ -415,9 +435,17 @@ class JobCoordinator:
 
         logging.info(f"{LogIcon.COMPLETE} Chamber 故障修复: {chamber_id}")
         trace_writer.emit('chamber_unfaulted', chamber_id=chamber_id)
+        self.metrics.snapshot('before_unfault_rebalance', chamber_id)
 
-        # 修复后重新评估：将已被改道到兄弟 chamber 的 wafer 重新择优分流
-        self._rebalance_after_unfault(chamber_id)
+        # 修复后重新评估：将尚未经过该工艺的 wafer 按连续性目标重新分流
+        module_str = chamber_id.rsplit('_', 1)[0]
+        process_type = ConfigService.get_process_type(module_str)
+        strategy = SystemConfig.SCHEDULING_CONFIG.get('fault_replan_strategy', 'continuity_pool')
+        if strategy == 'legacy_direct':
+            self._rebalance_after_unfault(chamber_id)
+        else:
+            self.path_planner.rebalance_process_type_after_unfault(process_type)
+        self.metrics.snapshot('after_unfault_rebalance', chamber_id)
         return True
 
     def _rebalance_after_unfault(self, chamber_id: str):

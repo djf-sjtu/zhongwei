@@ -17,32 +17,26 @@ from domain import ResourceValidator
 from common import LogIcon, trace_writer
 
 
-# Wafer 优先级权重 —— 暂存时间因子 + 工序位置因子的加权和。
-# 公式过去封装在 WaferPriorityCalculator，但只有一处调用、无状态、无策略变体，
-# 内联回这里把"调度决策依据"和"调度执行"放在同一文件里，提高 locality。
-_PRIORITY_STORAGE_WEIGHT = 0.5
-_PRIORITY_POSITION_WEIGHT = 0.5
-
-
-def _calculate_wafer_priority(wafer) -> float:
-    """优先级 = 暂存时间因子*权重 + 工序位置因子*权重。值越大越优先。"""
-    # 暂存时间因子：sigmoid，60s 约 0.5、300s 约 0.93
+def _calculate_wafer_priority(wafer):
+    """Prioritize continuity-critical chamber pickups before safe-location work."""
     storage_start = getattr(wafer, 'storage_start_time', None)
     if storage_start is None:
-        storage_factor = 0.0
+        continuity_critical = 0
+        storage_wait = 0.0
     else:
-        duration = time.time() - storage_start
-        storage_factor = 1.0 / (1.0 + math.exp(-0.02 * (duration - 60)))
+        continuity_critical = 1
+        storage_wait = time.time() - storage_start
 
-    # 工序位置因子：越靠后分数越高
     total = len(getattr(wafer, 'path_plan', []) or [])
-    if total > 0:
-        position_factor = getattr(wafer, 'current_step_index', 0) / total
-    else:
-        position_factor = 0.0
-
-    return (storage_factor * _PRIORITY_STORAGE_WEIGHT
-            + position_factor * _PRIORITY_POSITION_WEIGHT)
+    position = getattr(wafer, 'current_step_index', 0) / total if total > 0 else 0.0
+    if SystemConfig.SCHEDULING_CONFIG.get('fault_replan_strategy') == 'legacy_direct':
+        storage_factor = (
+            0.0
+            if storage_start is None
+            else 1.0 / (1.0 + math.exp(-0.02 * (storage_wait - 60)))
+        )
+        return storage_factor * 0.5 + position * 0.5
+    return continuity_critical, storage_wait, position
 
 
 class TransportExecutor:
@@ -116,8 +110,10 @@ class TransportExecutor:
         ready_tasks.sort(key=lambda x: x[3], reverse=True)
         idx, task, wafer, priority = ready_tasks[0]
 
-        logging.info(f"{LogIcon.PLAN} 优先级调度: {robot.robot_id} 选择 Wafer{wafer.wafer_id} "
-                     f"(优先级={priority:.3f}, 队列{len(robot.transport_queue)}个任务)")
+        logging.info(
+            f"{LogIcon.PLAN} 优先级调度: {robot.robot_id} 选择 Wafer{wafer.wafer_id} "
+            f"(优先级={priority}, 队列{len(robot.transport_queue)}个任务)"
+        )
 
         robot.transport_queue.pop(idx)
 
@@ -132,6 +128,10 @@ class TransportExecutor:
             to_location=task.to_location,
             robot_id=robot.robot_id,
         )
+        if self.scheduler.metrics:
+            self.scheduler.metrics.on_transport_started(wafer, task.from_location)
+        if is_chamber(task.from_location):
+            wafer.storage_start_time = None
 
         return task
 
@@ -147,6 +147,10 @@ class TransportExecutor:
 
     def _execute_transport(self, robot: SchedulingRobot, task: TransportTask):
         """执行传输任务"""
+        wafer = self.system.wafers.get(task.wafer_id)
+        if wafer:
+            wafer.active_transport_task = task
+            wafer.active_transport_eta = time.time() + self._estimate_transport_duration(task)
 
         def transport_thread():
             try:
@@ -176,16 +180,30 @@ class TransportExecutor:
 
                 # 7. 处理到达
                 self._handle_arrival(wafer, target)
+                wafer.active_transport_task = None
+                wafer.active_transport_eta = None
 
             except Exception as e:
                 logging.error(f"{LogIcon.ERROR} 传输错误: {e}")
                 self._clear_booking(task.to_location)
+                wafer = self.system.wafers.get(task.wafer_id)
+                if wafer:
+                    wafer.active_transport_task = None
+                    wafer.active_transport_eta = None
             finally:
                 robot.busy = 0
                 self.process_robot_queue(robot)
 
         robot.busy = 1
         threading.Thread(target=transport_thread, daemon=True).start()
+
+    def _estimate_transport_duration(self, task: TransportTask) -> float:
+        duration = SystemConfig.TRANSPORT_BASE_TIME + SystemConfig.PICK_PLACE_TIME * 2
+        from_z = LocationParser.get_z_level_for_location(task.from_location)
+        to_z = LocationParser.get_z_level_for_location(task.to_location)
+        if from_z != to_z:
+            duration += SystemConfig.Z_MOVE_TIME * 2
+        return duration
 
     def _update_path_if_delayed(self, wafer: SchedulingWafer, from_location: str):
         """如果延迟，更新路径规划"""
@@ -379,6 +397,13 @@ class TransportExecutor:
             self._log_deviation(wafer, ll.location_id, delay)
 
             def leave_ll():
+                planned_departure = wafer.path_plan[
+                    wafer.current_step_index - 1
+                ].estimated_departure
+                remaining_wait = planned_departure - time.time()
+                if remaining_wait > 0.001:
+                    threading.Timer(remaining_wait, leave_ll).start()
+                    return
                 ll.busy = 0
                 ll.current_wafer_id = None
                 wafer.busy = 0
@@ -417,10 +442,20 @@ class TransportExecutor:
             end_vent_id = '244' if ll_base=='LL_A' else '245'
             logging.info(f"{end_vent_id} {ll_base} LL INFO LoadLock LoadLock B venting end, spending time is {vent_duration}s")
 
-            ll.busy = 0
-            ll.current_wafer_id = None
-            wafer.busy = 0
-            self.scheduler.assign_next_task(wafer)
+            def leave_ll():
+                planned_departure = wafer.path_plan[
+                    wafer.current_step_index - 1
+                ].estimated_departure
+                remaining_wait = planned_departure - time.time()
+                if remaining_wait > 0.001:
+                    threading.Timer(remaining_wait, leave_ll).start()
+                    return
+                ll.busy = 0
+                ll.current_wafer_id = None
+                wafer.busy = 0
+                self.scheduler.assign_next_task(wafer)
+
+            leave_ll()
 
         threading.Timer(vent_duration, vent_complete).start()
 
@@ -458,6 +493,13 @@ class TransportExecutor:
             self._log_deviation(wafer, tbs.location_id, delay)
 
             def leave_tbs():
+                planned_departure = wafer.path_plan[
+                    wafer.current_step_index - 1
+                ].estimated_departure
+                remaining_wait = planned_departure - time.time()
+                if remaining_wait > 0.001:
+                    threading.Timer(remaining_wait, leave_tbs).start()
+                    return
                 tbs.busy = 0
                 tbs.booked_wafer_id = None
                 tbs.current_wafer_id = None
@@ -479,13 +521,29 @@ class TransportExecutor:
 
         def cooling_thread():
             time.sleep(cooling_time)
-            tbs.busy = 0
-            tbs.booked_wafer_id = None
-            tbs.current_wafer_id = None
-            wafer.busy = 0
 
             logging.info(f"{LogIcon.PROCESS} Wafer {wafer.wafer_id} 在 {tbs.location_id} 冷却完成")
-            self.scheduler.assign_next_task(wafer)
+            current_step = wafer.path_plan[wafer.current_step_index - 1]
+            wait_time = max(0.0, current_step.estimated_departure - time.time())
+
+            def leave_tbs():
+                planned_departure = wafer.path_plan[
+                    wafer.current_step_index - 1
+                ].estimated_departure
+                remaining_wait = planned_departure - time.time()
+                if remaining_wait > 0.001:
+                    threading.Timer(remaining_wait, leave_tbs).start()
+                    return
+                tbs.busy = 0
+                tbs.booked_wafer_id = None
+                tbs.current_wafer_id = None
+                wafer.busy = 0
+                self.scheduler.assign_next_task(wafer)
+
+            if wait_time > 0:
+                threading.Timer(wait_time, leave_tbs).start()
+            else:
+                leave_tbs()
 
         threading.Thread(target=cooling_thread, daemon=True).start()
 

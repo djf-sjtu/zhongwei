@@ -6,7 +6,7 @@
 """
 import threading
 import time
-from typing import Optional, List
+from typing import Dict, Optional, List
 from dataclasses import dataclass
 
 from models import Wafer, Chamber, module_id_to_str
@@ -81,6 +81,9 @@ class SchedulingWafer(SchedulingEntity):
         self.assignment_queue: List[TransportTask] = []
         self.scheduled_leave_time: Optional[float] = None
         self.path_plan: List[PathStep] = []  # 保存完整的路径规划
+        self.transport_not_before: Dict[int, float] = {}
+        self.active_transport_task: Optional[TransportTask] = None
+        self.active_transport_eta: Optional[float] = None
         self._temp_park_count: int = 0  # 已到达的 TEMP_PARK 步骤数（不占 sequence 索引）
 
     @property
